@@ -2,17 +2,17 @@ import AppKit
 import ImageIO
 import ScreenSaver
 
-private enum SourceKind {
+private enum SourceKind: Sendable {
     case original
     case preview
 }
 
-private struct SourceDirectory {
+private struct SourceDirectory: Sendable {
     let source: SourceKind
     let directory: URL
 }
 
-private struct TileItem {
+private struct TileItem: Sendable {
     let url: URL
     let pixelWidth: Int
     let pixelHeight: Int
@@ -36,7 +36,8 @@ private struct SkylineSegment {
     }
 }
 
-private let defaultImageLimit = 700
+private let defaultImageLimit = 6000
+private let previewImageLimit = 500
 private let minimumTileLongEdge = 900
 
 private final class LightpaperTiledView: NSView {
@@ -61,10 +62,20 @@ private final class LightpaperTiledView: NSView {
 
     override var isFlipped: Bool { true }
 
+    func appendItems(_ newItems: [TileItem]) {
+        guard !newItems.isEmpty else {
+            return
+        }
+        items.append(contentsOf: newItems)
+        invalidateTileLayout()
+        needsLayout = true
+        needsDisplay = true
+    }
+
     var pageCount: Int {
         updateTileLayout()
         let height = viewportHeight()
-        return max(Int(ceil(frame.height / height)), 1)
+        return max(Int(floor(frame.height / height)), 1)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -133,25 +144,32 @@ private final class LightpaperTiledView: NSView {
         updateEditorialLayout(availableWidth: availableWidth, scale: scale)
     }
 
+    private func invalidateTileLayout() {
+        tileFrames.removeAll(keepingCapacity: true)
+        laidOutWidth = 0
+        laidOutViewportHeight = 0
+        laidOutScale = 0
+    }
+
     private func updateEditorialLayout(availableWidth: CGFloat, scale: CGFloat) {
         let viewportHeight = viewportHeight()
         let targetHeights = [
-            min(max(viewportHeight * 0.62, 380), 720),
-            min(max(viewportHeight * 0.38, 260), 460),
-            min(max(viewportHeight * 0.52, 330), 620),
+            min(max(viewportHeight * 0.62, 380), 760),
+            min(max(viewportHeight * 0.36, 240), 440),
+            min(max(viewportHeight * 0.52, 320), 620),
             min(max(viewportHeight * 0.28, 190), 340),
-            min(max(viewportHeight * 0.46, 300), 540)
+            min(max(viewportHeight * 0.46, 300), 540),
+            min(max(viewportHeight * 0.34, 220), 420)
         ]
         var y: CGFloat = 0
-        var pageBottom = viewportHeight
         var cursor = 0
         var rowIndex = 0
 
         while cursor < items.count {
-            let remaining = max(pageBottom - y, 1)
             var row: [(item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)] = []
             var rowAspect: CGFloat = 0
-            let targetHeight = min(targetHeights[rowIndex % targetHeights.count], remaining)
+            let target = targetHeights[rowIndex % targetHeights.count]
+            var settled = false
 
             while cursor < items.count {
                 let item = items[cursor]
@@ -161,26 +179,23 @@ private final class LightpaperTiledView: NSView {
                 cursor += 1
 
                 let projectedHeight = availableWidth / rowAspect
-                if projectedHeight <= targetHeight {
+                if projectedHeight <= target {
+                    settled = true
                     break
                 }
             }
 
-            let exactHeight = availableWidth / rowAspect
-            let shouldFillPage = pageBottom - y - exactHeight < targetHeights.last ?? 240
-            let rowHeight = shouldFillPage ? remaining : min(exactHeight, remaining)
-            appendRow(row, y: y, height: rowHeight, availableWidth: availableWidth)
-
-            y += rowHeight
-            if pageBottom - y < 1 {
-                y = pageBottom
-                pageBottom += viewportHeight
+            guard settled else {
+                break
             }
 
+            let rowHeight = availableWidth / rowAspect
+            appendRow(row, y: y, height: rowHeight, availableWidth: availableWidth)
+            y += rowHeight
             rowIndex += 1
         }
 
-        frame = NSRect(x: 0, y: 0, width: availableWidth, height: pagedContentHeight(for: y))
+        frame = NSRect(x: 0, y: 0, width: availableWidth, height: max(y, viewportHeight))
     }
 
     private func appendRow(
@@ -205,11 +220,6 @@ private final class LightpaperTiledView: NSView {
 
     private func viewportHeight() -> CGFloat {
         max(enclosingScrollView?.contentView.bounds.height ?? bounds.height, 1)
-    }
-
-    private func pagedContentHeight(for contentHeight: CGFloat) -> CGFloat {
-        let pageHeight = viewportHeight()
-        return max(ceil(max(contentHeight, 1) / pageHeight) * pageHeight, pageHeight)
     }
 
     private func nativeSize(for item: TileItem, scale: CGFloat) -> NSSize {
@@ -245,6 +255,7 @@ private final class LightpaperTiledView: NSView {
 public final class LightpaperScreenSaverView: ScreenSaverView {
     private var scrollView: NSScrollView?
     private var tiledView: LightpaperTiledView?
+    private var loadedURLs = Set<URL>()
     private var currentPage = 0
 
     public override init?(frame: NSRect, isPreview: Bool) {
@@ -290,9 +301,18 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     }
 
     private func installImages() {
-        guard let items = loadInitialItems(), !items.isEmpty else {
+        let sourceDirectories = collectSourceDirectories()
+        guard !sourceDirectories.isEmpty else {
             return
         }
+
+        let targetLimit = isPreview ? previewImageLimit : defaultImageLimit
+        let initialLimit = isPreview ? previewImageLimit : min(defaultImageLimit, 700)
+        let items = collectTileItems(from: sourceDirectories, limit: initialLimit, excluding: [])
+        guard !items.isEmpty else {
+            return
+        }
+        loadedURLs = Set(items.map(\.url))
 
         let tiledView = LightpaperTiledView(items: items)
         let scrollView = NSScrollView(frame: bounds)
@@ -310,17 +330,66 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         self.scrollView = scrollView
         self.tiledView = tiledView
         scrollToCurrentPage(animated: false)
+        loadAdditionalItems(from: sourceDirectories, targetLimit: targetLimit)
     }
 
-    private func loadInitialItems() -> [TileItem]? {
-        let sourceDirectories = collectSourceDirectories()
-        guard !sourceDirectories.isEmpty else {
-            return nil
+    private func loadAdditionalItems(from sourceDirectories: [SourceDirectory], targetLimit: Int) {
+        let loadedURLs = loadedURLs
+        let needed = targetLimit - loadedURLs.count
+        guard needed > 0 else {
+            return
         }
 
-        let limit = isPreview ? min(defaultImageLimit, 160) : defaultImageLimit
-        let urls = collectMediaURLs(from: sourceDirectories, limit: limit)
-        return urls.compactMap(loadTileItem)
+        DispatchQueue.global(qos: .utility).async { [weak self, sourceDirectories, loadedURLs, needed] in
+            let candidateLimit = max(needed * 4, needed + 1000)
+            let candidates = collectCandidateURLs(
+                from: sourceDirectories,
+                limit: candidateLimit,
+                excluding: loadedURLs
+            )
+
+            var seenURLs = loadedURLs
+            var batch: [TileItem] = []
+            var usable = 0
+            let batchSize = 60
+
+            func dispatchBatch() {
+                guard !batch.isEmpty else {
+                    return
+                }
+                let toAppend = batch
+                batch.removeAll(keepingCapacity: true)
+                DispatchQueue.main.async { [weak self] in
+                    self?.appendAdditionalItems(toAppend)
+                }
+            }
+
+            for url in candidates {
+                guard usable < needed else {
+                    break
+                }
+                guard !seenURLs.contains(url) else {
+                    continue
+                }
+                seenURLs.insert(url)
+                guard let item = loadTileItem(url: url) else {
+                    continue
+                }
+                batch.append(item)
+                usable += 1
+
+                if batch.count >= batchSize {
+                    dispatchBatch()
+                }
+            }
+
+            dispatchBatch()
+        }
+    }
+
+    private func appendAdditionalItems(_ items: [TileItem]) {
+        loadedURLs.formUnion(items.map(\.url))
+        tiledView?.appendItems(items)
     }
 
     private func advancePage() {
@@ -418,9 +487,49 @@ private func collectSourceDirectories() -> [SourceDirectory] {
     return sourceDirectories
 }
 
-private func collectMediaURLs(from sourceDirectories: [SourceDirectory], limit: Int) -> [URL] {
-    var urls: [URL] = []
+private func collectTileItems(from sourceDirectories: [SourceDirectory], limit: Int, excluding excludedURLs: Set<URL>) -> [TileItem] {
+    var items: [TileItem] = []
     var seenURLs = Set<URL>()
+    seenURLs.formUnion(excludedURLs)
+    let leafDirectories = sourceDirectories
+        .flatMap { candidateDirectories(for: $0.source, under: $0.directory) }
+        .shuffled()
+
+    for directory in leafDirectories {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            continue
+        }
+
+        for url in contents.shuffled() {
+            guard items.count < limit else {
+                return items
+            }
+            guard !seenURLs.contains(url) else {
+                continue
+            }
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true,
+                  isLikelyImageURL(url) else {
+                continue
+            }
+            seenURLs.insert(url)
+            guard let item = loadTileItem(url: url) else {
+                continue
+            }
+            items.append(item)
+        }
+    }
+
+    return items
+}
+
+private func collectCandidateURLs(from sourceDirectories: [SourceDirectory], limit: Int, excluding excludedURLs: Set<URL>) -> [URL] {
+    var urls: [URL] = []
+    var seenURLs = excludedURLs
     let leafDirectories = sourceDirectories
         .flatMap { candidateDirectories(for: $0.source, under: $0.directory) }
         .shuffled()
