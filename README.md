@@ -9,6 +9,16 @@ Build the app bundle:
 open .build/Lightpaper.app
 ```
 
+Build and install the screen saver:
+
+```sh
+./scripts/build-saver.sh
+./scripts/install-saver.sh
+```
+
+The installer copies `.build/Lightpaper.saver` to `~/Library/Screen Savers`.
+After that, choose Lightpaper in System Settings > Screen Saver.
+
 By default, Lightpaper opens fullscreen, hides the cursor, and auto-hides the
 menu bar and Dock. Pass `--windowed` when running the viewer directly if you want
 a resizable debug window.
