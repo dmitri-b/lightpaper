@@ -5,7 +5,7 @@ Personal fullscreen macOS app tooling for reading locally cached Lightroom deskt
 ## Install screen saver from GitHub
 
 ```sh
-git clone https://github.com/dmitri-b/lightpaper.git && lightpaper/scripts/install-saver.sh
+gh repo clone dmitri-b/lightpaper && lightpaper/scripts/install-saver.sh
 ```
 
 Then choose Lightpaper in System Settings > Screen Saver.
