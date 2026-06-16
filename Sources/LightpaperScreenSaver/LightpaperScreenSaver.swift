@@ -1,6 +1,7 @@
 import AppKit
 import ImageIO
 import ScreenSaver
+import SQLite3
 
 private enum SourceKind: Sendable {
     case original
@@ -38,7 +39,17 @@ private struct SkylineSegment {
 
 private let defaultImageLimit = 6000
 private let previewImageLimit = 500
-private let minimumTileLongEdge = 900
+// Admits 640px renditions while still excluding the tiny 320px thumbnails.
+private let minimumTileLongEdge = 560
+
+// Upper bound on photos sampled for one screen. Tiles are capped to native
+// resolution (never upscaled), so a dense screen of small previews can need
+// ~100; the layout uses only as many as it takes to fill the screen and ignores
+// the rest.
+private let photosPerScreen = 140
+// Only previews whose long edge is at least this many pixels are eligible, so
+// enlarged mosaic tiles stay reasonably crisp. 640 covers most months.
+private let minimumRenditionLongSide = 640.0
 
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
@@ -83,8 +94,10 @@ private final class LightpaperTiledView: NSView {
         dirtyRect.fill()
         updateTileLayout()
 
+        let backing = max(window?.backingScaleFactor ?? laidOutScale, 1)
         for (index, frame) in tileFrames.enumerated() where frame.intersects(dirtyRect) {
-            guard let image = cachedImage(for: items[index])?.image,
+            let maxPixelSize = Int(ceil(max(frame.width, frame.height) * backing))
+            guard let image = cachedImage(for: items[index], maxPixelSize: maxPixelSize)?.image,
                   let context = NSGraphicsContext.current?.cgContext else {
                 continue
             }
@@ -161,41 +174,76 @@ private final class LightpaperTiledView: NSView {
             min(max(viewportHeight * 0.46, 300), 540),
             min(max(viewportHeight * 0.34, 220), 420)
         ]
-        var y: CGFloat = 0
+        // 1. Compose justified rows, packing enough images into each row that its
+        //    height never exceeds the smallest native size in the row — so no
+        //    image is ever scaled above its own resolution. Low-res photos simply
+        //    end up in denser rows. Stop once we have enough rows to overshoot one
+        //    screen.
+        typealias RowEntry = (item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)
+        var rows: [(entries: [RowEntry], height: CGFloat)] = []
         var cursor = 0
         var rowIndex = 0
+        var totalHeight: CGFloat = 0
 
         while cursor < items.count {
-            var row: [(item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)] = []
+            var entries: [RowEntry] = []
             var rowAspect: CGFloat = 0
+            var minNativeHeight = CGFloat.greatestFiniteMagnitude
             let target = targetHeights[rowIndex % targetHeights.count]
             var settled = false
 
             while cursor < items.count {
                 let item = items[cursor]
                 let size = nativeSize(for: item, scale: scale)
-                row.append((item, size.width, size.height))
+                entries.append((item, size.width, size.height))
                 rowAspect += size.width / size.height
+                minNativeHeight = min(minNativeHeight, size.height)
                 cursor += 1
 
-                let projectedHeight = availableWidth / rowAspect
-                if projectedHeight <= target {
+                // Settle once the row is short enough both for the aesthetic
+                // target and to keep every image at or below native resolution.
+                if availableWidth / rowAspect <= min(target, minNativeHeight) {
                     settled = true
                     break
                 }
             }
 
-            guard settled else {
+            if !settled {
+                // Ran out of images mid-row; drop this partial row unless it is
+                // all we have, so the bottom never shows a stretched fragment.
+                if rows.isEmpty, !entries.isEmpty {
+                    let height = min(availableWidth / rowAspect, minNativeHeight)
+                    rows.append((entries, height))
+                    totalHeight += height
+                }
                 break
             }
 
-            let rowHeight = availableWidth / rowAspect
-            appendRow(row, y: y, height: rowHeight, availableWidth: availableWidth)
-            y += rowHeight
+            // Natural justified height, capped so the lowest-res image in the row
+            // is never enlarged past its native size.
+            let height = min(availableWidth / rowAspect, minNativeHeight)
+            rows.append((entries, height))
+            totalHeight += height
             rowIndex += 1
+
+            if totalHeight >= viewportHeight {
+                break
+            }
         }
 
-        frame = NSRect(x: 0, y: 0, width: availableWidth, height: max(y, viewportHeight))
+        // 2. Scale the rows to fill the screen, but only ever downscale. When
+        //    there are enough photos the rows overshoot one screen and shrink to
+        //    fit; when a month (plus spillover) is too small to fill, the bottom
+        //    is left dark rather than upscaling anything.
+        let fill = totalHeight > 0 ? min(1, viewportHeight / totalHeight) : 1
+        var y: CGFloat = 0
+        for row in rows {
+            let height = row.height * fill
+            appendRow(row.entries, y: y, height: height, availableWidth: availableWidth)
+            y += height
+        }
+
+        frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
     }
 
     private func appendRow(
@@ -229,9 +277,15 @@ private final class LightpaperTiledView: NSView {
         )
     }
 
-    private func cachedImage(for item: TileItem) -> CachedCGImage? {
+    private func cachedImage(for item: TileItem, maxPixelSize: Int) -> CachedCGImage? {
         let key = item.url as NSURL
-        if let image = imageCache.object(forKey: key) {
+        // Decode only as large as the tile needs, and never larger than the
+        // image's own resolution — keeps decoding fast and memory bounded across
+        // a dense screenful of tiles.
+        let target = max(min(maxPixelSize, max(item.pixelWidth, item.pixelHeight)), 1)
+
+        if let image = imageCache.object(forKey: key),
+           max(image.image.width, image.image.height) >= Int(Double(target) * 0.9) {
             return image
         }
 
@@ -239,7 +293,7 @@ private final class LightpaperTiledView: NSView {
               let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: max(item.pixelWidth, item.pixelHeight),
+                kCGImageSourceThumbnailMaxPixelSize: target,
                 kCGImageSourceShouldCache: false
               ] as CFDictionary) else {
             return nil
@@ -251,12 +305,108 @@ private final class LightpaperTiledView: NSView {
     }
 }
 
+/// A self-running "indexing your library" placeholder: a centered mosaic of
+/// pastel tiles that shimmer in a diagonal wave, with a caption beneath. Shown
+/// while images are read off disk so the screen is never just black.
+private final class IndexingAnimationView: NSView {
+    private var tileLayers: [CALayer] = []
+    private let captionLayer = CATextLayer()
+    private let columns = 7
+    private let rows = 5
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        captionLayer.string = "Indexing your library…"
+        captionLayer.alignmentMode = .center
+        captionLayer.foregroundColor = NSColor(white: 0.78, alpha: 1).cgColor
+        captionLayer.font = NSFont.systemFont(ofSize: 17, weight: .medium)
+        captionLayer.fontSize = 17
+        captionLayer.contentsScale = scale
+        layer?.addSublayer(captionLayer)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        rebuildTiles()
+    }
+
+    private func rebuildTiles() {
+        guard let hostLayer = layer, bounds.width > 1, bounds.height > 1 else {
+            return
+        }
+
+        tileLayers.forEach { $0.removeFromSuperlayer() }
+        tileLayers.removeAll(keepingCapacity: true)
+
+        let block = min(bounds.width, bounds.height) * 0.32
+        let spacing = block * 0.06
+        let tileSize = (block - spacing * CGFloat(columns - 1)) / CGFloat(columns)
+        let gridWidth = tileSize * CGFloat(columns) + spacing * CGFloat(columns - 1)
+        let gridHeight = tileSize * CGFloat(rows) + spacing * CGFloat(rows - 1)
+        let originX = (bounds.width - gridWidth) / 2
+        let originY = (bounds.height - gridHeight) / 2 + block * 0.12
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        for row in 0..<rows {
+            for col in 0..<columns {
+                let tile = CALayer()
+                let x = originX + CGFloat(col) * (tileSize + spacing)
+                let y = originY + CGFloat(row) * (tileSize + spacing)
+                tile.frame = CGRect(x: x, y: y, width: tileSize, height: tileSize)
+                tile.cornerRadius = tileSize * 0.18
+
+                // Soft pastel gradient from cyan through violet to pink.
+                let hue = (0.55 + CGFloat(col) / CGFloat(columns) * 0.5)
+                    .truncatingRemainder(dividingBy: 1)
+                tile.backgroundColor = NSColor(hue: hue, saturation: 0.45, brightness: 0.96, alpha: 1).cgColor
+                tile.opacity = 0.18
+                hostLayer.insertSublayer(tile, below: captionLayer)
+                tileLayers.append(tile)
+
+                let shimmer = CABasicAnimation(keyPath: "opacity")
+                shimmer.fromValue = 0.16
+                shimmer.toValue = 0.95
+                shimmer.duration = 0.9
+                shimmer.autoreverses = true
+                shimmer.repeatCount = .infinity
+                shimmer.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                shimmer.timeOffset = Double(col + row) * 0.16
+                tile.add(shimmer, forKey: "shimmer")
+            }
+        }
+
+        let captionHeight: CGFloat = 24
+        captionLayer.frame = CGRect(
+            x: 0,
+            y: originY - block * 0.18 - captionHeight,
+            width: bounds.width,
+            height: captionHeight
+        )
+
+        CATransaction.commit()
+    }
+}
+
 @objc(LightpaperScreenSaverView)
 public final class LightpaperScreenSaverView: ScreenSaverView {
-    private var scrollView: NSScrollView?
-    private var tiledView: LightpaperTiledView?
-    private var loadedURLs = Set<URL>()
-    private var currentPage = 0
+    private var indexingView: IndexingAnimationView?
+    private var currentGallery: NSScrollView?
+    private var monthCatalog: MonthCatalog?
+    private var fallbackPool: [URL] = []
+    private var lastMonth: String?
+    private var isLoading = false
+    private var isSwapping = false
+    private var didStart = false
 
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -278,42 +428,149 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
 
     public override func startAnimation() {
         super.startAnimation()
-        if tiledView == nil {
-            installImages()
+        if !didStart && !isLoading {
+            didStart = true
+            buildCatalog()
         }
     }
 
     public override func animateOneFrame() {
-        advancePage()
+        showNextMonth(animated: true)
     }
 
     public override func layout() {
         super.layout()
-        scrollView?.frame = bounds
-        tiledView?.layoutSubtreeIfNeeded()
-        scrollToCurrentPage(animated: false)
+        indexingView?.frame = bounds
+        currentGallery?.frame = bounds
+        currentGallery?.documentView?.layoutSubtreeIfNeeded()
     }
 
     private func commonInit() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        animationTimeInterval = isPreview ? 5 : 8
+        animationTimeInterval = isPreview ? 6 : 9
     }
 
-    private func installImages() {
-        let sourceDirectories = collectSourceDirectories()
-        guard !sourceDirectories.isEmpty else {
+    private func buildCatalog() {
+        isLoading = true
+        showIndexingAnimation()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let accounts = findCatalogAccounts()
+            let catalog = buildMonthCatalog(accounts: accounts, minLongSide: minimumRenditionLongSide)
+
+            // Fall back to whole-library random sampling only if the Lightroom
+            // catalog can't be read, so the saver still shows something.
+            var pool: [URL] = []
+            if catalog == nil {
+                let sources = collectSourceDirectories()
+                pool = collectCandidateURLs(from: sources, limit: defaultImageLimit, excluding: [])
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.isLoading = false
+                self.monthCatalog = catalog
+                self.fallbackPool = pool
+                self.showNextMonth(animated: false)
+            }
+        }
+    }
+
+    /// Picks a fresh month at random (different from the one currently shown),
+    /// samples photos from it, and cross-fades them in as the new screen.
+    private func showNextMonth(animated: Bool) {
+        guard !isSwapping else {
             return
         }
-
-        let targetLimit = isPreview ? previewImageLimit : defaultImageLimit
-        let initialLimit = isPreview ? previewImageLimit : min(defaultImageLimit, 700)
-        let items = collectTileItems(from: sourceDirectories, limit: initialLimit, excluding: [])
-        guard !items.isEmpty else {
+        let sample = nextSampleURLs()
+        guard !sample.isEmpty else {
             return
         }
-        loadedURLs = Set(items.map(\.url))
+        isSwapping = true
 
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let items = sample.compactMap(loadTileItem)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.isSwapping = false
+                guard !items.isEmpty else {
+                    return
+                }
+                self.presentGallery(items: items, animated: animated)
+            }
+        }
+    }
+
+    private func nextSampleURLs() -> [URL] {
+        guard let catalog = monthCatalog, !catalog.months.isEmpty else {
+            return Array(fallbackPool.shuffled().prefix(photosPerScreen))
+        }
+
+        let months = catalog.months
+        let month = randomMonth(excluding: lastMonth, from: months)
+        lastMonth = month
+
+        var result = (catalog.pathsByMonth[month] ?? []).shuffled()
+        // If the chosen month is too small to fill the screen without upscaling,
+        // overrun into the nearest neighbouring months (closest first) until
+        // there are enough photos.
+        if let center = months.firstIndex(of: month) {
+            var step = 1
+            while result.count < photosPerScreen, step < months.count {
+                for neighbor in [center - step, center + step] where neighbor >= 0 && neighbor < months.count {
+                    result.append(contentsOf: (catalog.pathsByMonth[months[neighbor]] ?? []).shuffled())
+                    if result.count >= photosPerScreen {
+                        break
+                    }
+                }
+                step += 1
+            }
+        }
+
+        return Array(result.prefix(photosPerScreen))
+    }
+
+    private func randomMonth(excluding excluded: String?, from months: [String]) -> String {
+        guard months.count > 1, let excluded else {
+            return months.randomElement() ?? months[0]
+        }
+        let candidates = months.filter { $0 != excluded }
+        return candidates.randomElement() ?? months[0]
+    }
+
+    private func presentGallery(items: [TileItem], animated: Bool) {
+        hideIndexingAnimation()
+
+        let gallery = makeGallery(items: items)
+        gallery.frame = bounds
+        gallery.autoresizingMask = [.width, .height]
+        addSubview(gallery)
+        gallery.documentView?.layoutSubtreeIfNeeded()
+
+        let previous = currentGallery
+        currentGallery = gallery
+
+        if animated {
+            gallery.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 1.0
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                gallery.animator().alphaValue = 1
+                previous?.animator().alphaValue = 0
+            } completionHandler: {
+                previous?.removeFromSuperview()
+            }
+        } else {
+            previous?.removeFromSuperview()
+        }
+    }
+
+    private func makeGallery(items: [TileItem]) -> NSScrollView {
         let tiledView = LightpaperTiledView(items: items)
         let scrollView = NSScrollView(frame: bounds)
         scrollView.drawsBackground = true
@@ -321,115 +578,204 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
-        scrollView.autoresizingMask = [.width, .height]
         scrollView.verticalScrollElasticity = .none
         scrollView.horizontalScrollElasticity = .none
         scrollView.documentView = tiledView
-
-        addSubview(scrollView)
-        self.scrollView = scrollView
-        self.tiledView = tiledView
-        scrollToCurrentPage(animated: false)
-        loadAdditionalItems(from: sourceDirectories, targetLimit: targetLimit)
+        return scrollView
     }
 
-    private func loadAdditionalItems(from sourceDirectories: [SourceDirectory], targetLimit: Int) {
-        let loadedURLs = loadedURLs
-        let needed = targetLimit - loadedURLs.count
-        guard needed > 0 else {
+    private func showIndexingAnimation() {
+        guard indexingView == nil else {
             return
         }
+        let view = IndexingAnimationView(frame: bounds)
+        view.autoresizingMask = [.width, .height]
+        addSubview(view)
+        indexingView = view
+    }
 
-        DispatchQueue.global(qos: .utility).async { [weak self, sourceDirectories, loadedURLs, needed] in
-            let candidateLimit = max(needed * 4, needed + 1000)
-            let candidates = collectCandidateURLs(
-                from: sourceDirectories,
-                limit: candidateLimit,
-                excluding: loadedURLs
-            )
+    private func hideIndexingAnimation() {
+        guard let view = indexingView else {
+            return
+        }
+        indexingView = nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.6
+            view.animator().alphaValue = 0
+        } completionHandler: {
+            view.removeFromSuperview()
+        }
+    }
+}
 
-            var seenURLs = loadedURLs
-            var batch: [TileItem] = []
-            var usable = 0
-            let batchSize = 60
+// MARK: - Lightroom catalog (month index)
 
-            func dispatchBatch() {
-                guard !batch.isEmpty else {
-                    return
-                }
-                let toAppend = batch
-                batch.removeAll(keepingCapacity: true)
-                DispatchQueue.main.async { [weak self] in
-                    self?.appendAdditionalItems(toAppend)
-                }
+/// Preview URLs grouped by capture month ("YYYY-MM"), read from the Lightroom
+/// catalog. The capture date is not stored in the preview files themselves
+/// (they are hash-named and EXIF-stripped), so it is recovered from the
+/// `Managed Catalog.mcat` SQLite database and joined to on-disk previews via
+/// `previews.db`.
+private struct MonthCatalog {
+    let months: [String]
+    let pathsByMonth: [String: [URL]]
+}
+
+/// Account folders that contain both the rendition map and the catalog.
+private func findCatalogAccounts() -> [URL] {
+    guard let libraryURL = defaultLibraryCandidates().first(where: { url in
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }) else {
+        return []
+    }
+
+    guard let children = try? FileManager.default.contentsOfDirectory(
+        at: libraryURL,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return []
+    }
+
+    return children.filter { child in
+        FileManager.default.fileExists(atPath: child.appendingPathComponent("previews.db").path)
+            && FileManager.default.fileExists(atPath: child.appendingPathComponent("Managed Catalog.mcat").path)
+    }
+}
+
+private func openReadOnlyDatabase(_ url: URL) -> OpaquePointer? {
+    var db: OpaquePointer?
+    // `immutable=1` skips locking and the -wal, so we can read even while
+    // Lightroom holds the database open.
+    let uri = url.absoluteString + "?immutable=1"
+    guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+        sqlite3_close(db)
+        return nil
+    }
+    return db
+}
+
+/// Extracts the capture month ("YYYY-MM") from an asset's MessagePack content
+/// blob. The value is stored as `captureDate` followed by a MessagePack
+/// fixstr (`0xA0...0xBF` length marker) holding an ISO 8601 timestamp.
+private func captureMonth(in bytes: UnsafeRawBufferPointer) -> String? {
+    let key = Array("captureDate".utf8)
+    let buffer = bytes.bindMemory(to: UInt8.self)
+    let count = buffer.count
+    let keyCount = key.count
+    guard count > keyCount + 8 else {
+        return nil
+    }
+
+    var i = 0
+    let limit = count - keyCount
+    while i <= limit {
+        if buffer[i] == key[0] {
+            var k = 1
+            while k < keyCount && buffer[i + k] == key[k] {
+                k += 1
             }
-
-            for url in candidates {
-                guard usable < needed else {
-                    break
+            if k == keyCount {
+                let marker = buffer[i + keyCount]
+                guard marker >= 0xA0, marker <= 0xBF else {
+                    return nil
                 }
-                guard !seenURLs.contains(url) else {
+                let length = Int(marker - 0xA0)
+                let start = i + keyCount + 1
+                guard length >= 7, start + 7 <= count else {
+                    return nil
+                }
+                var chars = [UInt8](repeating: 0, count: 7)
+                for j in 0..<7 {
+                    chars[j] = buffer[start + j]
+                }
+                guard chars[4] == UInt8(ascii: "-"),
+                      let month = String(bytes: chars, encoding: .ascii) else {
+                    return nil
+                }
+                return month
+            }
+        }
+        i += 1
+    }
+    return nil
+}
+
+private func buildMonthCatalog(accounts: [URL], minLongSide: Double) -> MonthCatalog? {
+    var pathsByMonth: [String: [URL]] = [:]
+
+    for account in accounts {
+        let previewsURL = account.appendingPathComponent("previews.db")
+        let catalogURL = account.appendingPathComponent("Managed Catalog.mcat")
+
+        // 1. Best (largest) qualifying rendition path per asset id.
+        guard let previewsDB = openReadOnlyDatabase(previewsURL) else {
+            continue
+        }
+        var bestLongSide: [Int64: Double] = [:]
+        var bestPath: [Int64: String] = [:]
+        var pathStmt: OpaquePointer?
+        if sqlite3_prepare_v2(previewsDB, "SELECT localAssetId, longSide, path FROM RenditionPath", -1, &pathStmt, nil) == SQLITE_OK {
+            while sqlite3_step(pathStmt) == SQLITE_ROW {
+                let longSide = sqlite3_column_double(pathStmt, 1)
+                guard longSide >= minLongSide else {
                     continue
                 }
-                seenURLs.insert(url)
-                guard let item = loadTileItem(url: url) else {
+                let assetId = Int64(sqlite3_column_double(pathStmt, 0))
+                if let existing = bestLongSide[assetId], existing >= longSide {
                     continue
                 }
-                batch.append(item)
-                usable += 1
-
-                if batch.count >= batchSize {
-                    dispatchBatch()
+                guard let cString = sqlite3_column_text(pathStmt, 2) else {
+                    continue
                 }
+                bestLongSide[assetId] = longSide
+                bestPath[assetId] = String(cString: cString)
             }
-
-            dispatchBatch()
         }
-    }
+        sqlite3_finalize(pathStmt)
+        sqlite3_close(previewsDB)
 
-    private func appendAdditionalItems(_ items: [TileItem]) {
-        loadedURLs.formUnion(items.map(\.url))
-        tiledView?.appendItems(items)
-    }
-
-    private func advancePage() {
-        guard let tiledView else {
-            return
+        guard !bestPath.isEmpty else {
+            continue
         }
 
-        let pageCount = tiledView.pageCount
-        guard pageCount > 1 else {
-            currentPage = 0
-            scrollToCurrentPage(animated: false)
-            return
+        // 2. Capture month per asset, joined to the rendition paths above.
+        guard let catalogDB = openReadOnlyDatabase(catalogURL) else {
+            continue
         }
-
-        currentPage = (currentPage + 1) % pageCount
-        scrollToCurrentPage(animated: true)
-    }
-
-    private func scrollToCurrentPage(animated: Bool) {
-        guard let scrollView else {
-            return
-        }
-
-        tiledView?.layoutSubtreeIfNeeded()
-        let pageHeight = max(scrollView.contentView.bounds.height, 1)
-        let target = NSPoint(x: 0, y: CGFloat(currentPage) * pageHeight)
-
-        if animated {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.35
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                scrollView.contentView.animator().setBoundsOrigin(target)
-            } completionHandler: {
-                scrollView.reflectScrolledClipView(scrollView.contentView)
+        let query = """
+        SELECT d.localDocId, r.content FROM docs d \
+        JOIN revs r ON r.sequence = d.winningRevSequence \
+        WHERE d.type = 'asset'
+        """
+        var assetStmt: OpaquePointer?
+        if sqlite3_prepare_v2(catalogDB, query, -1, &assetStmt, nil) == SQLITE_OK {
+            while sqlite3_step(assetStmt) == SQLITE_ROW {
+                let assetId = sqlite3_column_int64(assetStmt, 0)
+                guard let path = bestPath[assetId],
+                      let blob = sqlite3_column_blob(assetStmt, 1) else {
+                    continue
+                }
+                let length = Int(sqlite3_column_bytes(assetStmt, 1))
+                guard length > 0 else {
+                    continue
+                }
+                let month = captureMonth(in: UnsafeRawBufferPointer(start: blob, count: length))
+                guard let month, !month.hasPrefix("0000") else {
+                    continue
+                }
+                pathsByMonth[month, default: []].append(URL(fileURLWithPath: path))
             }
-        } else {
-            scrollView.contentView.setBoundsOrigin(target)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
+        sqlite3_finalize(assetStmt)
+        sqlite3_close(catalogDB)
     }
+
+    let months = pathsByMonth.keys.sorted()
+    guard !months.isEmpty else {
+        return nil
+    }
+    return MonthCatalog(months: months, pathsByMonth: pathsByMonth)
 }
 
 private func defaultLibraryCandidates() -> [URL] {
@@ -485,46 +831,6 @@ private func collectSourceDirectories() -> [SourceDirectory] {
     }
 
     return sourceDirectories
-}
-
-private func collectTileItems(from sourceDirectories: [SourceDirectory], limit: Int, excluding excludedURLs: Set<URL>) -> [TileItem] {
-    var items: [TileItem] = []
-    var seenURLs = Set<URL>()
-    seenURLs.formUnion(excludedURLs)
-    let leafDirectories = sourceDirectories
-        .flatMap { candidateDirectories(for: $0.source, under: $0.directory) }
-        .shuffled()
-
-    for directory in leafDirectories {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            continue
-        }
-
-        for url in contents.shuffled() {
-            guard items.count < limit else {
-                return items
-            }
-            guard !seenURLs.contains(url) else {
-                continue
-            }
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
-                  values.isRegularFile == true,
-                  isLikelyImageURL(url) else {
-                continue
-            }
-            seenURLs.insert(url)
-            guard let item = loadTileItem(url: url) else {
-                continue
-            }
-            items.append(item)
-        }
-    }
-
-    return items
 }
 
 private func collectCandidateURLs(from sourceDirectories: [SourceDirectory], limit: Int, excluding excludedURLs: Set<URL>) -> [URL] {
