@@ -65,6 +65,26 @@ cd lightpaper
 ./scripts/install-saver.sh
 ```
 
+## Privacy mode
+
+If a shared screen shouldn't show portraits, turn on privacy mode: photos that
+prominently feature a person (headshots, posed shots) are skipped, while scenery
+that merely contains a small, distant bystander is kept.
+
+```sh
+defaults -currentHost write dev.lightpaper.Lightpaper.ScreenSaver hidePeople -bool true
+```
+
+Turn it back off with `-bool false`. Either way, flush the screen-saver host so
+the change is picked up (same as after updating):
+
+```sh
+killall legacyScreenSaver legacyScreenSaver-x86_64 WallpaperAgent 2>/dev/null
+```
+
+Detection runs entirely on-device (Apple's Vision framework); no photo ever
+leaves your Mac.
+
 ## Screenshots
 
 Final wallpaper:
