@@ -44,6 +44,19 @@ The one-line script also clears the download quarantine flag for you; on older
 macOS that alone is enough, but recent versions still require the Open Anyway
 step above.
 
+### Updating
+
+After upgrading (`brew upgrade` or re-running the script), macOS may keep
+running the previously loaded bundle from its cache, so you still see the old
+version. Flush it by recycling the screen-saver host processes:
+
+```sh
+killall legacyScreenSaver legacyScreenSaver-x86_64 WallpaperAgent 2>/dev/null
+```
+
+Then reopen System Settings > Screen Saver. (Logging out and back in achieves
+the same thing.)
+
 ### Build from source
 
 ```sh
