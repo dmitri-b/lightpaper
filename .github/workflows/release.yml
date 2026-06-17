@@ -30,7 +30,14 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" Lightpaper.saver.zip --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Release already exists (e.g. a re-run): replace the asset instead
+            # of failing on the duplicate upload.
+            gh release upload "$GITHUB_REF_NAME" Lightpaper.saver.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" Lightpaper.saver.zip --generate-notes
+          fi
 
       - name: Bump Homebrew cask
         if: ${{ env.TAP_TOKEN != '' }}
