@@ -17,6 +17,9 @@ private struct TileItem: Sendable {
     let url: URL
     let pixelWidth: Int
     let pixelHeight: Int
+    // 64-bit difference hash of a tiny grayscale rendition, used to spot
+    // visually near-identical shots. `nil` when the image couldn't be decoded.
+    let hash: UInt64?
 }
 
 private final class CachedCGImage {
@@ -47,9 +50,20 @@ private let minimumTileLongEdge = 560
 // ~100; the layout uses only as many as it takes to fill the screen and ignores
 // the rest.
 private let photosPerScreen = 140
+// Sample extra photos from the chosen month so that, after near-duplicate
+// removal culls the burst frames and look-alikes a single month naturally has,
+// there are still enough left to fill the screen from that one month. The layout
+// uses only what it needs and ignores the surplus.
+private let sampleCandidateLimit = 240
 // Only previews whose long edge is at least this many pixels are eligible, so
 // enlarged mosaic tiles stay reasonably crisp. 640 covers most months.
 private let minimumRenditionLongSide = 640.0
+
+// Two tiles whose 64-bit difference hashes differ by at most this many bits are
+// treated as the same shot (e.g. consecutive frames from a burst) and are not
+// placed on one screen together. Identical frames score 0; unrelated scenes
+// typically sit well above 20, so this stays clear of false positives.
+private let nearDuplicateHammingThreshold = 10
 
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
@@ -457,10 +471,21 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let accounts = findCatalogAccounts()
-            let catalog = buildMonthCatalog(accounts: accounts, minLongSide: minimumRenditionLongSide)
+            var catalog = buildMonthCatalog(accounts: accounts, minLongSide: minimumRenditionLongSide)
 
-            // Fall back to whole-library random sampling only if the Lightroom
-            // catalog can't be read, so the saver still shows something.
+            if let catalog {
+                // Persist the index whenever Lightroom's previews.db is readable,
+                // so we can keep grouping by month later.
+                saveCatalogCache(catalog)
+            } else {
+                // previews.db is gone (Lightroom removes it while running). Reuse
+                // the last index we saved so screens stay grouped by month instead
+                // of dropping to random sampling.
+                catalog = loadCatalogCache()
+            }
+
+            // Fall back to whole-library random sampling only if neither a fresh
+            // nor a cached catalog is available, so the saver still shows something.
             var pool: [URL] = []
             if catalog == nil {
                 let sources = collectSourceDirectories()
@@ -492,7 +517,7 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         isSwapping = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let items = sample.compactMap(loadTileItem)
+            let items = deduplicateByLook(sample.compactMap(loadTileItem))
             DispatchQueue.main.async { [weak self] in
                 guard let self else {
                     return
@@ -532,7 +557,7 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
             }
         }
 
-        return Array(result.prefix(photosPerScreen))
+        return Array(result.prefix(sampleCandidateLimit))
     }
 
     private func randomMonth(excluding excluded: String?, from months: [String]) -> String {
@@ -618,6 +643,60 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
 private struct MonthCatalog {
     let months: [String]
     let pathsByMonth: [String: [URL]]
+}
+
+/// On-disk form of `MonthCatalog` (URLs flattened to paths) so the last good
+/// index survives across launches — and across periods when Lightroom is running
+/// and has removed `previews.db`.
+private struct CachedCatalog: Codable {
+    let months: [String]
+    let pathsByMonth: [String: [String]]
+}
+
+private func catalogCacheURL() -> URL? {
+    guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        return nil
+    }
+    return caches
+        .appendingPathComponent("dev.lightpaper.Lightpaper", isDirectory: true)
+        .appendingPathComponent("month-catalog.json")
+}
+
+/// Best-effort: writes the freshly built index to disk so it can be reused while
+/// Lightroom is running. Failures are ignored — the cache is an optimisation.
+private func saveCatalogCache(_ catalog: MonthCatalog) {
+    guard let url = catalogCacheURL() else {
+        return
+    }
+    let payload = CachedCatalog(
+        months: catalog.months,
+        pathsByMonth: catalog.pathsByMonth.mapValues { $0.map(\.path) }
+    )
+    do {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(payload)
+        try data.write(to: url, options: .atomic)
+    } catch {
+        // Ignore: a missing cache just means we rebuild or fall back next time.
+    }
+}
+
+/// Reads the last index we saved. Stale preview paths are harmless — `loadTileItem`
+/// skips any file that no longer exists.
+private func loadCatalogCache() -> MonthCatalog? {
+    guard let url = catalogCacheURL(),
+          let data = try? Data(contentsOf: url),
+          let payload = try? JSONDecoder().decode(CachedCatalog.self, from: data),
+          !payload.months.isEmpty else {
+        return nil
+    }
+    let pathsByMonth = payload.pathsByMonth.mapValues { paths in
+        paths.map { URL(fileURLWithPath: $0) }
+    }
+    return MonthCatalog(months: payload.months, pathsByMonth: pathsByMonth)
 }
 
 /// Account folders that contain both the rendition map and the catalog.
@@ -923,6 +1002,74 @@ private func loadTileItem(url: URL) -> TileItem? {
     return TileItem(
         url: url,
         pixelWidth: displayWidth,
-        pixelHeight: displayHeight
+        pixelHeight: displayHeight,
+        hash: perceptualHash(for: source)
     )
+}
+
+/// Computes a 64-bit difference hash (dHash): a 9×8 grayscale rendition where
+/// each bit records whether a pixel is brighter than its right-hand neighbour.
+/// Robust to scaling, light compression, and small exposure shifts, so frames
+/// from the same burst land within a few bits of each other.
+private func perceptualHash(for source: CGImageSource) -> UInt64? {
+    let width = 9
+    let height = 8
+    guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceThumbnailMaxPixelSize: 32,
+        kCGImageSourceShouldCache: false
+    ] as CFDictionary) else {
+        return nil
+    }
+
+    var pixels = [UInt8](repeating: 0, count: width * height)
+    guard let context = CGContext(
+        data: &pixels,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGImageAlphaInfo.none.rawValue
+    ) else {
+        return nil
+    }
+    context.interpolationQuality = .low
+    context.draw(thumbnail, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    var hash: UInt64 = 0
+    var bit: UInt64 = 0
+    for row in 0..<height {
+        for col in 0..<(width - 1) {
+            if pixels[row * width + col] > pixels[row * width + col + 1] {
+                hash |= (1 << bit)
+            }
+            bit += 1
+        }
+    }
+    return hash
+}
+
+/// Drops tiles that look near-identical to one already kept, preserving order so
+/// the (already shuffled) sample stays varied. Items without a hash are always
+/// kept rather than risk discarding something we couldn't compare.
+private func deduplicateByLook(_ items: [TileItem]) -> [TileItem] {
+    var kept: [TileItem] = []
+    var keptHashes: [UInt64] = []
+
+    for item in items {
+        guard let hash = item.hash else {
+            kept.append(item)
+            continue
+        }
+        let isNearDuplicate = keptHashes.contains { existing in
+            (existing ^ hash).nonzeroBitCount <= nearDuplicateHammingThreshold
+        }
+        if !isNearDuplicate {
+            kept.append(item)
+            keptHashes.append(hash)
+        }
+    }
+
+    return kept
 }
