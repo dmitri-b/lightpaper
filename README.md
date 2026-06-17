@@ -1,6 +1,11 @@
 # Lightpaper
 
-Fullscreen macOS wallpaper / screen saver for photos cached by Lightroom Desktop.
+Photographers have tens or hundreds of thousands of images sitting unused in
+Lightroom. Lightpaper turns the local Lightroom cache into a macOS wallpaper /
+screen saver, so those photos keep resurfacing for you, your family, and friends.
+
+Lightpaper only reads local cached Lightroom Desktop files. It does not contact
+Adobe, sign in to your account, or communicate with remote Adobe storage.
 
 ## Install
 
@@ -10,7 +15,7 @@ the latest [GitHub release](https://github.com/dmitri-b/lightpaper/releases).
 Homebrew (recommended):
 
 ```sh
-brew install --cask dmitri-b/lightpaper/lightpaper
+brew install --cask dmitri-b/tap/lightpaper
 ```
 
 Or a one-line script:
