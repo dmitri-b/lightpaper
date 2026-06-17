@@ -14,17 +14,29 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 rm -rf "$SAVER_DIR"
 mkdir -p "$MACOS_DIR" "$BUILD_DIR"
 
-swiftc \
-    -parse-as-library \
-    -O \
-    -module-cache-path "$BUILD_DIR/ModuleCache" \
-    -module-name "$PRODUCT_NAME" \
-    -emit-library \
-    -o "$MACOS_DIR/$PRODUCT_NAME" \
-    -framework AppKit \
-    -framework ImageIO \
-    -framework ScreenSaver \
-    "$ROOT_DIR/Sources/LightpaperScreenSaver/LightpaperScreenSaver.swift"
+# Build a universal binary so the released saver runs on both Apple Silicon and
+# Intel Macs. swiftc emits one slice per arch; lipo stitches them together.
+ARCHS=${ARCHS:-"arm64 x86_64"}
+SLICES=""
+for arch in $ARCHS; do
+    slice="$BUILD_DIR/$PRODUCT_NAME-$arch"
+    swiftc \
+        -parse-as-library \
+        -O \
+        -target "$arch-apple-macos14" \
+        -module-cache-path "$BUILD_DIR/ModuleCache" \
+        -module-name "$PRODUCT_NAME" \
+        -emit-library \
+        -o "$slice" \
+        -framework AppKit \
+        -framework ImageIO \
+        -framework ScreenSaver \
+        "$ROOT_DIR/Sources/LightpaperScreenSaver/LightpaperScreenSaver.swift"
+    SLICES="$SLICES $slice"
+done
+
+# shellcheck disable=SC2086
+lipo -create -output "$MACOS_DIR/$PRODUCT_NAME" $SLICES
 
 cp "$ROOT_DIR/Resources/Lightpaper.saver/Contents/Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod +x "$MACOS_DIR/$PRODUCT_NAME"

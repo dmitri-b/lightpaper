@@ -1,47 +1,81 @@
 # Lightpaper
 
-Personal fullscreen macOS app tooling for reading locally cached Lightroom desktop photos.
+Fullscreen macOS wallpaper / screen saver for photos cached by Lightroom Desktop.
 
-## Install screen saver from GitHub
+## Install
+
+No toolchain required — both options install a prebuilt universal `.saver` from
+the latest [GitHub release](https://github.com/dmitri-b/lightpaper/releases).
+
+Homebrew (recommended):
 
 ```sh
-gh repo clone dmitri-b/lightpaper && lightpaper/scripts/install-saver.sh
+brew install --cask dmitri-b/lightpaper/lightpaper
 ```
 
-Then choose Lightpaper in System Settings > Screen Saver.
+Or a one-line script:
 
-Build the app bundle:
+```sh
+curl -fsSL https://raw.githubusercontent.com/dmitri-b/lightpaper/master/scripts/install.sh | sh
+```
+
+Enable it:
+
+1. Open System Settings.
+2. Go to Screen Saver.
+3. Pick Lightpaper.
+
+Lightpaper is not notarized. If macOS blocks it, clear the quarantine flag:
+
+```sh
+xattr -dr com.apple.quarantine "$HOME/Library/Screen Savers/Lightpaper.saver"
+```
+
+### Build from source
+
+```sh
+gh repo clone dmitri-b/lightpaper
+cd lightpaper
+./scripts/install-saver.sh
+```
+
+## Screenshots
+
+Final wallpaper:
+
+![Final Lightpaper wallpaper screenshot](docs/screenshots/final-wallpaper.png)
+
+macOS Screen Saver setting:
+
+![Lightpaper selected in macOS Screen Saver settings](docs/screenshots/macos-screen-saver-settings-123.png)
+
+## Debug
+
+Build and open the app bundle:
 
 ```sh
 ./scripts/build-app.sh
 open .build/Lightpaper.app
 ```
 
-By default, Lightpaper opens fullscreen, hides the cursor, and auto-hides the
-menu bar and Dock. Pass `--windowed` when running the viewer directly if you want
-a resizable debug window.
+Run windowed:
 
-The first slice is a read-only scanner:
+```sh
+swift run lightpaper-view -- --windowed --mode mosaic --limit 500
+swift run lightpaper-view -- --windowed --mode slideshow --source previews
+```
+
+Scan the Lightroom cache:
 
 ```sh
 swift run lightpaper-scan -- --source previews --limit 10
 swift run lightpaper-scan -- --json
 ```
 
-It discovers `~/Pictures/Lightroom Library.lrlibrary`, scans local `previews/` and
-`originals/` folders, validates image files by magic bytes, and reports a small
-manifest. It does not modify Adobe files.
-
-The second slice is a simple Lightroom cache slideshow viewer:
-
-```sh
-swift run lightpaper-view -- --mode mosaic --windowed --limit 500
-swift run lightpaper-view -- --mode slideshow --source previews
-swift run lightpaper-view -- --windowed --limit 50 --quit-after 5
-```
-
 Keys:
 
-- Space / Right Arrow / Down Arrow / L: next screen or photo
-- Left Arrow / Up Arrow / J: previous screen or photo
-- Esc / Q: quit
+- `Space`, `Right`, `Down`, `L`: next
+- `Left`, `Up`, `J`: previous
+- `Esc`, `Q`: quit
+
+Requires a local Lightroom Desktop library at `~/Pictures/Lightroom Library.lrlibrary`.

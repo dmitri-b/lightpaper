@@ -1,0 +1,29 @@
+name: Release saver
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal screen saver
+        run: ./scripts/build-saver.sh
+
+      - name: Verify universal binary
+        run: lipo -info .build/Lightpaper.saver/Contents/MacOS/LightpaperScreenSaver
+
+      - name: Package
+        run: ditto -c -k --keepParent .build/Lightpaper.saver Lightpaper.saver.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" Lightpaper.saver.zip --generate-notes
