@@ -325,6 +325,7 @@ private final class LightpaperTiledView: NSView {
 private final class IndexingAnimationView: NSView {
     private var tileLayers: [CALayer] = []
     private let captionLayer = CATextLayer()
+    private let versionLayer = CATextLayer()
     private let columns = 7
     private let rows = 5
 
@@ -341,6 +342,19 @@ private final class IndexingAnimationView: NSView {
         captionLayer.fontSize = 17
         captionLayer.contentsScale = scale
         layer?.addSublayer(captionLayer)
+
+        // Version line, so a running saver can be told apart from a stale cached
+        // install. Reads from this bundle's Info.plist (short version + build).
+        let info = Bundle(for: IndexingAnimationView.self).infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        versionLayer.string = "Lightpaper \(short) (\(build))"
+        versionLayer.alignmentMode = .center
+        versionLayer.foregroundColor = NSColor(white: 0.5, alpha: 1).cgColor
+        versionLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        versionLayer.fontSize = 12
+        versionLayer.contentsScale = scale
+        layer?.addSublayer(versionLayer)
     }
 
     required init?(coder: NSCoder) {
@@ -400,11 +414,20 @@ private final class IndexingAnimationView: NSView {
         }
 
         let captionHeight: CGFloat = 24
+        let captionY = originY - block * 0.18 - captionHeight
         captionLayer.frame = CGRect(
             x: 0,
-            y: originY - block * 0.18 - captionHeight,
+            y: captionY,
             width: bounds.width,
             height: captionHeight
+        )
+
+        let versionHeight: CGFloat = 18
+        versionLayer.frame = CGRect(
+            x: 0,
+            y: captionY - versionHeight - 6,
+            width: bounds.width,
+            height: versionHeight
         )
 
         CATransaction.commit()
@@ -421,6 +444,10 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     private var isLoading = false
     private var isSwapping = false
     private var didStart = false
+    private var indexingShownAt: Date?
+    // Keep the indexing screen (which shows the version) up long enough to read,
+    // even when the cached index loads almost instantly.
+    private let minimumIndexingDuration: TimeInterval = 2.5
 
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -499,7 +526,18 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
                 self.isLoading = false
                 self.monthCatalog = catalog
                 self.fallbackPool = pool
-                self.showNextMonth(animated: false)
+
+                // Hold the indexing/version screen for a readable minimum even
+                // when the index was ready immediately.
+                let elapsed = self.indexingShownAt.map { Date().timeIntervalSince($0) } ?? 0
+                let remaining = max(0, self.minimumIndexingDuration - elapsed)
+                if remaining > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                        self?.showNextMonth(animated: false)
+                    }
+                } else {
+                    self.showNextMonth(animated: false)
+                }
             }
         }
     }
@@ -617,6 +655,7 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         view.autoresizingMask = [.width, .height]
         addSubview(view)
         indexingView = view
+        indexingShownAt = Date()
     }
 
     private func hideIndexingAnimation() {
