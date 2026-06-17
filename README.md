@@ -30,11 +30,19 @@ Enable it:
 2. Go to Screen Saver.
 3. Pick Lightpaper.
 
-Lightpaper is not notarized. If macOS blocks it, clear the quarantine flag:
+### If macOS blocks it
 
-```sh
-xattr -dr com.apple.quarantine "$HOME/Library/Screen Savers/Lightpaper.saver"
-```
+Lightpaper is not notarized, so Gatekeeper blocks it the first time with
+"Apple could not verify ... is free of malware". To allow it (once per Mac):
+
+1. In System Settings > Screen Saver, select Lightpaper and dismiss the dialog.
+2. Open System Settings > Privacy & Security and scroll to the Security section.
+3. Click **Open Anyway** next to the Lightpaper message and authenticate.
+4. Re-select Lightpaper in Screen Saver — it now loads.
+
+The one-line script also clears the download quarantine flag for you; on older
+macOS that alone is enough, but recent versions still require the Open Anyway
+step above.
 
 ### Build from source
 
