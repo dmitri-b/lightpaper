@@ -11,6 +11,10 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    env:
+      # Fine-grained PAT with Contents: read/write on dmitri-b/homebrew-tap.
+      # When unset, the cask-bump step is skipped and the release still ships.
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +31,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "$GITHUB_REF_NAME" Lightpaper.saver.zip --generate-notes
+
+      - name: Bump Homebrew cask
+        if: ${{ env.TAP_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sha="$(shasum -a 256 Lightpaper.saver.zip | awk '{print $1}')"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/dmitri-b/homebrew-tap.git" tap
+          cask="tap/Casks/lightpaper.rb"
+          sed -i.bak -E "s/^( *version )\"[^\"]*\"/\1\"${version}\"/" "$cask"
+          sed -i.bak -E "s/^( *sha256 )\"[^\"]*\"/\1\"${sha}\"/" "$cask"
+          rm -f "${cask}.bak"
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git -C tap diff --quiet; then
+            echo "Cask already at ${version} / ${sha}; nothing to do."
+          else
+            git -C tap commit -am "lightpaper ${version}"
+            git -C tap push
+          fi
