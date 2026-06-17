@@ -31,6 +31,7 @@ for arch in $ARCHS; do
         -framework AppKit \
         -framework ImageIO \
         -framework ScreenSaver \
+        -framework Vision \
         "$ROOT_DIR/Sources/LightpaperScreenSaver/LightpaperScreenSaver.swift"
     SLICES="$SLICES $slice"
 done

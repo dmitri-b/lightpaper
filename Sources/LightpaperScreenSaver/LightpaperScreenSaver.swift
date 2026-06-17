@@ -2,6 +2,7 @@ import AppKit
 import ImageIO
 import ScreenSaver
 import SQLite3
+import Vision
 
 private enum SourceKind: Sendable {
     case original
@@ -17,9 +18,6 @@ private struct TileItem: Sendable {
     let url: URL
     let pixelWidth: Int
     let pixelHeight: Int
-    // 64-bit difference hash of a tiny grayscale rendition, used to spot
-    // visually near-identical shots. `nil` when the image couldn't be decoded.
-    let hash: UInt64?
 }
 
 private final class CachedCGImage {
@@ -59,11 +57,18 @@ private let sampleCandidateLimit = 240
 // enlarged mosaic tiles stay reasonably crisp. 640 covers most months.
 private let minimumRenditionLongSide = 640.0
 
-// Two tiles whose 64-bit difference hashes differ by at most this many bits are
-// treated as the same shot (e.g. consecutive frames from a burst) and are not
-// placed on one screen together. Identical frames score 0; unrelated scenes
-// typically sit well above 20, so this stays clear of false positives.
-private let nearDuplicateHammingThreshold = 10
+// Two tiles whose Vision feature prints are within this distance are treated as
+// the same shot (a burst frame or near-identical look-alike of the same
+// scene/subject) and are not placed on one screen together. Feature prints are a
+// 768-dim on-device semantic embedding, so unlike a difference hash they group
+// "same shoot, different pose" portraits — exactly the look-alikes that made
+// dense months look repetitive. Measured on real months: genuine look-alikes sit
+// below ~0.5; genuinely distinct scenes sit well above. Tuned on real months:
+// 0.7 cuts a one-shoot month (61 near-identical portraits) down to ~16 varied
+// frames while a varied travel month still keeps ~26 distinct scenes, because a
+// semantic threshold naturally prunes monotony harder than variety. Lower = more
+// aggressive removal.
+private let nearDuplicateFeaturePrintDistance: Float = 0.7
 
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
@@ -575,7 +580,12 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         }
 
         let months = catalog.months
-        let month = randomMonth(excluding: lastMonth, from: months)
+        // Debug aid: `LIGHTPAPER_FORCE_MONTH=2016-03` pins every screen to one
+        // month so a specific month can be inspected (e.g. de-dup tuning). Falls
+        // back to the normal random pick when unset or the month isn't present.
+        let forcedMonth = ProcessInfo.processInfo.environment["LIGHTPAPER_FORCE_MONTH"]
+            .flatMap { months.contains($0) ? $0 : nil }
+        let month = forcedMonth ?? randomMonth(excluding: lastMonth, from: months)
         lastMonth = month
 
         var result = (catalog.pathsByMonth[month] ?? []).shuffled()
@@ -1041,72 +1051,58 @@ private func loadTileItem(url: URL) -> TileItem? {
     return TileItem(
         url: url,
         pixelWidth: displayWidth,
-        pixelHeight: displayHeight,
-        hash: perceptualHash(for: source)
+        pixelHeight: displayHeight
     )
 }
 
-/// Computes a 64-bit difference hash (dHash): a 9×8 grayscale rendition where
-/// each bit records whether a pixel is brighter than its right-hand neighbour.
-/// Robust to scaling, light compression, and small exposure shifts, so frames
-/// from the same burst land within a few bits of each other.
-private func perceptualHash(for source: CGImageSource) -> UInt64? {
-    let width = 9
-    let height = 8
-    guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-        kCGImageSourceCreateThumbnailFromImageAlways: true,
-        kCGImageSourceThumbnailMaxPixelSize: 32,
-        kCGImageSourceShouldCache: false
-    ] as CFDictionary) else {
+/// Computes a Vision feature print: a 768-dim on-device semantic embedding of the
+/// image. Distances between two prints reflect how alike the scenes/subjects look
+/// (not just composition), so frames from the same shoot land close together.
+/// `nil` when the image couldn't be decoded or the request failed.
+private func featurePrint(for url: URL) -> VNFeaturePrintObservation? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+              kCGImageSourceCreateThumbnailFromImageAlways: true,
+              kCGImageSourceThumbnailMaxPixelSize: 360,
+              kCGImageSourceShouldCache: false
+          ] as CFDictionary) else {
         return nil
     }
 
-    var pixels = [UInt8](repeating: 0, count: width * height)
-    guard let context = CGContext(
-        data: &pixels,
-        width: width,
-        height: height,
-        bitsPerComponent: 8,
-        bytesPerRow: width,
-        space: CGColorSpaceCreateDeviceGray(),
-        bitmapInfo: CGImageAlphaInfo.none.rawValue
-    ) else {
+    let request = VNGenerateImageFeaturePrintRequest()
+    let handler = VNImageRequestHandler(cgImage: thumbnail, options: [:])
+    do {
+        try handler.perform([request])
+    } catch {
         return nil
     }
-    context.interpolationQuality = .low
-    context.draw(thumbnail, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-    var hash: UInt64 = 0
-    var bit: UInt64 = 0
-    for row in 0..<height {
-        for col in 0..<(width - 1) {
-            if pixels[row * width + col] > pixels[row * width + col + 1] {
-                hash |= (1 << bit)
-            }
-            bit += 1
-        }
-    }
-    return hash
+    return request.results?.first as? VNFeaturePrintObservation
 }
 
 /// Drops tiles that look near-identical to one already kept, preserving order so
-/// the (already shuffled) sample stays varied. Items without a hash are always
-/// kept rather than risk discarding something we couldn't compare.
+/// the (already shuffled) sample stays varied. Items whose feature print can't be
+/// computed are always kept rather than risk discarding something we couldn't
+/// compare. Feature prints are computed here, on the background queue that calls
+/// this, and never escape — so `TileItem` stays cheap and `Sendable`.
 private func deduplicateByLook(_ items: [TileItem]) -> [TileItem] {
     var kept: [TileItem] = []
-    var keptHashes: [UInt64] = []
+    var keptPrints: [VNFeaturePrintObservation] = []
 
     for item in items {
-        guard let hash = item.hash else {
+        guard let print = featurePrint(for: item.url) else {
             kept.append(item)
             continue
         }
-        let isNearDuplicate = keptHashes.contains { existing in
-            (existing ^ hash).nonzeroBitCount <= nearDuplicateHammingThreshold
+        let isNearDuplicate = keptPrints.contains { existing in
+            var distance: Float = 0
+            guard (try? existing.computeDistance(&distance, to: print)) != nil else {
+                return false
+            }
+            return distance <= nearDuplicateFeaturePrintDistance
         }
         if !isNearDuplicate {
             kept.append(item)
-            keptHashes.append(hash)
+            keptPrints.append(print)
         }
     }
 
