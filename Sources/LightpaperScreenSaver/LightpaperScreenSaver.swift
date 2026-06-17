@@ -70,6 +70,16 @@ private let minimumRenditionLongSide = 640.0
 // aggressive removal.
 private let nearDuplicateFeaturePrintDistance: Float = 0.7
 
+// Privacy mode: a photo counts as "about a person" when a detected face or body
+// box is at least this tall relative to the frame, so headshots and posed shots
+// are dropped while scenery with a small, distant bystander is kept. Faces are
+// smaller than bodies, so the face threshold is lower. Both are normalized
+// (0..1) against image height. These start conservative ("prominent only") and
+// are meant to be tuned on real months via LIGHTPAPER_HIDE_PEOPLE +
+// LIGHTPAPER_FORCE_MONTH.
+private let minimumProminentFaceHeightFraction: CGFloat = 0.14
+private let minimumProminentBodyHeightFraction: CGFloat = 0.45
+
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
     private var tileFrames: [NSRect] = []
@@ -560,7 +570,8 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         isSwapping = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let items = deduplicateByLook(sample.compactMap(loadTileItem))
+            let hidePeople = hidePeopleEnabled()
+            let items = deduplicateByLook(sample.compactMap(loadTileItem), hidePeople: hidePeople)
             DispatchQueue.main.async { [weak self] in
                 guard let self else {
                     return
@@ -589,15 +600,19 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         lastMonth = month
 
         var result = (catalog.pathsByMonth[month] ?? []).shuffled()
-        // If the chosen month is too small to fill the screen without upscaling,
-        // overrun into the nearest neighbouring months (closest first) until
-        // there are enough photos.
+        // Top the candidate pool up to the full dedup buffer (sampleCandidateLimit),
+        // overrunning into the nearest neighbouring months (closest first). A month
+        // can have enough raw previews yet still dedup down below a screenful when
+        // it is full of look-alikes (e.g. a month of similar landscapes), so we
+        // always pull neighbouring-month variety up to the buffer rather than
+        // stopping at photosPerScreen — otherwise the layout, which only ever
+        // downscales, leaves the bottom of the screen black.
         if let center = months.firstIndex(of: month) {
             var step = 1
-            while result.count < photosPerScreen, step < months.count {
+            while result.count < sampleCandidateLimit, step < months.count {
                 for neighbor in [center - step, center + step] where neighbor >= 0 && neighbor < months.count {
                     result.append(contentsOf: (catalog.pathsByMonth[months[neighbor]] ?? []).shuffled())
-                    if result.count >= photosPerScreen {
+                    if result.count >= sampleCandidateLimit {
                         break
                     }
                 }
@@ -1055,41 +1070,74 @@ private func loadTileItem(url: URL) -> TileItem? {
     )
 }
 
-/// Computes a Vision feature print: a 768-dim on-device semantic embedding of the
-/// image. Distances between two prints reflect how alike the scenes/subjects look
-/// (not just composition), so frames from the same shoot land close together.
-/// `nil` when the image couldn't be decoded or the request failed.
-private func featurePrint(for url: URL) -> VNFeaturePrintObservation? {
+private struct PhotoAnalysis {
+    /// A 768-dim on-device semantic embedding; `nil` when the image couldn't be
+    /// decoded or the request failed.
+    let featurePrint: VNFeaturePrintObservation?
+    /// True when privacy detection ran and found a face or body large enough to
+    /// make the photo "about a person".
+    let hasProminentPerson: Bool
+}
+
+/// Decodes the image once (a small thumbnail) and runs the Vision requests it
+/// needs in a single pass. The feature print is always computed; face and body
+/// detection only run when `detectPeople` is set, so default behaviour keeps the
+/// exact same cost. Distances between feature prints reflect how alike the
+/// scenes/subjects look (not just composition), so frames from the same shoot
+/// land close together.
+private func analyzePhoto(at url: URL, detectPeople: Bool) -> PhotoAnalysis {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
           let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
               kCGImageSourceCreateThumbnailFromImageAlways: true,
               kCGImageSourceThumbnailMaxPixelSize: 360,
               kCGImageSourceShouldCache: false
           ] as CFDictionary) else {
-        return nil
+        return PhotoAnalysis(featurePrint: nil, hasProminentPerson: false)
     }
 
-    let request = VNGenerateImageFeaturePrintRequest()
-    let handler = VNImageRequestHandler(cgImage: thumbnail, options: [:])
-    do {
-        try handler.perform([request])
-    } catch {
-        return nil
+    let printRequest = VNGenerateImageFeaturePrintRequest()
+    var requests: [VNRequest] = [printRequest]
+    let faceRequest = detectPeople ? VNDetectFaceRectanglesRequest() : nil
+    let bodyRequest = detectPeople ? VNDetectHumanRectanglesRequest() : nil
+    if let faceRequest {
+        requests.append(faceRequest)
     }
-    return request.results?.first as? VNFeaturePrintObservation
+    if let bodyRequest {
+        requests.append(bodyRequest)
+    }
+
+    let handler = VNImageRequestHandler(cgImage: thumbnail, options: [:])
+    try? handler.perform(requests)
+
+    // VN*Observation boundingBox is normalized to the image, so .height is the
+    // fraction of frame height the subject occupies.
+    let prominent =
+        (faceRequest?.results ?? []).contains { $0.boundingBox.height >= minimumProminentFaceHeightFraction }
+        || (bodyRequest?.results ?? []).contains { $0.boundingBox.height >= minimumProminentBodyHeightFraction }
+
+    return PhotoAnalysis(
+        featurePrint: printRequest.results?.first as? VNFeaturePrintObservation,
+        hasProminentPerson: prominent
+    )
 }
 
 /// Drops tiles that look near-identical to one already kept, preserving order so
-/// the (already shuffled) sample stays varied. Items whose feature print can't be
-/// computed are always kept rather than risk discarding something we couldn't
-/// compare. Feature prints are computed here, on the background queue that calls
-/// this, and never escape — so `TileItem` stays cheap and `Sendable`.
-private func deduplicateByLook(_ items: [TileItem]) -> [TileItem] {
+/// the (already shuffled) sample stays varied. With `hidePeople`, also drops any
+/// photo that prominently features a person (privacy mode). Items whose feature
+/// print can't be computed are always kept rather than risk discarding something
+/// we couldn't compare — but a confirmed prominent person is always dropped.
+/// Vision requests run here, on the background queue that calls this, and never
+/// escape — so `TileItem` stays cheap and `Sendable`.
+private func deduplicateByLook(_ items: [TileItem], hidePeople: Bool) -> [TileItem] {
     var kept: [TileItem] = []
     var keptPrints: [VNFeaturePrintObservation] = []
 
     for item in items {
-        guard let print = featurePrint(for: item.url) else {
+        let analysis = analyzePhoto(at: item.url, detectPeople: hidePeople)
+        if hidePeople && analysis.hasProminentPerson {
+            continue
+        }
+        guard let print = analysis.featurePrint else {
             kept.append(item)
             continue
         }
@@ -1107,4 +1155,15 @@ private func deduplicateByLook(_ items: [TileItem]) -> [TileItem] {
     }
 
     return kept
+}
+
+/// Privacy mode: when on, photos that prominently feature a person are skipped.
+/// `LIGHTPAPER_HIDE_PEOPLE=1` overrides for testing (mirrors LIGHTPAPER_FORCE_MONTH);
+/// otherwise the persisted screen-saver default is read.
+private func hidePeopleEnabled() -> Bool {
+    if let raw = ProcessInfo.processInfo.environment["LIGHTPAPER_HIDE_PEOPLE"] {
+        return (raw as NSString).boolValue
+    }
+    let defaults = ScreenSaverDefaults(forModuleWithName: "dev.lightpaper.Lightpaper.ScreenSaver")
+    return defaults?.bool(forKey: "hidePeople") ?? false
 }
