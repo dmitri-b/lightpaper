@@ -80,6 +80,14 @@ private let nearDuplicateFeaturePrintDistance: Float = 0.7
 private let minimumProminentFaceHeightFraction: CGFloat = 0.14
 private let minimumProminentBodyHeightFraction: CGFloat = 0.45
 
+// How far a row may be enlarged past the native size of its smallest rendition.
+// Lightroom's standard previews are modest-resolution, so without some headroom
+// the justified rows always collapse to many tiny tiles (the row can never be
+// taller than its smallest native image). Allowing a bounded upscale trades a
+// little softness for far fewer, much larger tiles — the "show the photos big"
+// goal. 1.0 = the old never-upscale behaviour.
+private let maxRowUpscale: CGFloat = 2.4
+
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
     private var tileFrames: [NSRect] = []
@@ -87,6 +95,11 @@ private final class LightpaperTiledView: NSView {
     private var laidOutViewportHeight: CGFloat = 0
     private var laidOutScale: CGFloat = 0
     private let imageCache = NSCache<NSURL, CachedCGImage>()
+    // One clipping container layer per tile (holding the drifting image layer),
+    // rebuilt whenever the layout changes. Tracked so the previous set can be
+    // torn down before a rebuild.
+    private var tileLayers: [CALayer] = []
+    private var layoutGeneration = 0
 
     init(items: [TileItem]) {
         self.items = items
@@ -118,22 +131,6 @@ private final class LightpaperTiledView: NSView {
         return max(Int(floor(frame.height / height)), 1)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
-        dirtyRect.fill()
-        updateTileLayout()
-
-        let backing = max(window?.backingScaleFactor ?? laidOutScale, 1)
-        for (index, frame) in tileFrames.enumerated() where frame.intersects(dirtyRect) {
-            let maxPixelSize = Int(ceil(max(frame.width, frame.height) * backing))
-            guard let image = cachedImage(for: items[index], maxPixelSize: maxPixelSize)?.image,
-                  let context = NSGraphicsContext.current?.cgContext else {
-                continue
-            }
-            draw(image, in: frame, context: context)
-        }
-    }
-
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         needsLayout = true
@@ -149,23 +146,60 @@ private final class LightpaperTiledView: NSView {
         updateTileLayout()
     }
 
-    private func draw(_ image: CGImage, in frame: NSRect, context: CGContext) {
-        let imageSize = NSSize(width: image.width, height: image.height)
-        let scale = max(frame.width / imageSize.width, frame.height / imageSize.height)
-        let drawSize = NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
-        let drawFrame = NSRect(
-            x: (frame.width - drawSize.width) / 2,
-            y: (frame.height - drawSize.height) / 2,
-            width: drawSize.width,
-            height: drawSize.height
-        )
+    /// Rebuilds the per-tile layer tree to match `tileFrames`: a clipping
+    /// container per tile holding an aspect-fill image layer. Images decode
+    /// off-main and their `contents` are assigned when ready. Called only when
+    /// the layout actually changes.
+    private func rebuildTileLayers() {
+        guard let hostLayer = layer else {
+            return
+        }
+        layoutGeneration += 1
+        let generation = layoutGeneration
+        let backing = max(window?.backingScaleFactor ?? laidOutScale, 1)
 
-        context.saveGState()
-        context.translateBy(x: frame.minX, y: frame.maxY)
-        context.scaleBy(x: 1, y: -1)
-        context.clip(to: CGRect(x: 0, y: 0, width: frame.width, height: frame.height))
-        context.draw(image, in: drawFrame)
-        context.restoreGState()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        tileLayers.forEach { $0.removeFromSuperlayer() }
+        tileLayers.removeAll(keepingCapacity: true)
+
+        for (index, frame) in tileFrames.enumerated() {
+            let container = CALayer()
+            container.frame = frame
+            container.masksToBounds = true
+            container.backgroundColor = NSColor.black.cgColor
+
+            let imageLayer = CALayer()
+            imageLayer.frame = container.bounds
+            imageLayer.contentsGravity = .resizeAspectFill
+            imageLayer.contentsScale = backing
+            imageLayer.masksToBounds = true
+            container.addSublayer(imageLayer)
+
+            hostLayer.addSublayer(container)
+            tileLayers.append(container)
+
+            let item = items[index]
+            let maxPixelSize = Int(ceil(max(frame.width, frame.height) * backing))
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let cached = self?.cachedImage(for: item, maxPixelSize: maxPixelSize) else {
+                    return
+                }
+                DispatchQueue.main.async { [weak self] in
+                    // Skip if the layout was rebuilt while this decode was in flight.
+                    guard let self, self.layoutGeneration == generation else {
+                        return
+                    }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    imageLayer.contents = cached.image
+                    CATransaction.commit()
+                }
+            }
+        }
+
+        CATransaction.commit()
     }
 
     private func updateTileLayout() {
@@ -195,19 +229,24 @@ private final class LightpaperTiledView: NSView {
 
     private func updateEditorialLayout(availableWidth: CGFloat, scale: CGFloat) {
         let viewportHeight = viewportHeight()
+        // Tuned for a "looser" mosaic: ~2-3 rows of 3-4 images = ~6-12 large
+        // tiles per screen, so each rendition gets real estate. The high max
+        // clamps matter most — without them no row ever exceeded ~760px tall on a
+        // 4K/5K display, which was the real cap on tile size. Rows still never
+        // exceed the smallest native size in the row, so low-res months simply
+        // pack denser (more, smaller rows) rather than upscaling.
         let targetHeights = [
-            min(max(viewportHeight * 0.62, 380), 760),
-            min(max(viewportHeight * 0.36, 240), 440),
-            min(max(viewportHeight * 0.52, 320), 620),
-            min(max(viewportHeight * 0.28, 190), 340),
-            min(max(viewportHeight * 0.46, 300), 540),
-            min(max(viewportHeight * 0.34, 220), 420)
+            min(max(viewportHeight * 0.66, 460), 1300),
+            min(max(viewportHeight * 0.50, 360), 1040),
+            min(max(viewportHeight * 0.60, 420), 1180),
+            min(max(viewportHeight * 0.46, 320), 940)
         ]
         // 1. Compose justified rows, packing enough images into each row that its
-        //    height never exceeds the smallest native size in the row — so no
-        //    image is ever scaled above its own resolution. Low-res photos simply
-        //    end up in denser rows. Stop once we have enough rows to overshoot one
-        //    screen.
+        //    height never exceeds `maxRowUpscale`× the smallest native size in the
+        //    row — so the lowest-res image is enlarged by at most that factor.
+        //    Low-res photos still end up in denser rows; the headroom is what lets
+        //    a row of modest Lightroom previews stand tall instead of collapsing
+        //    to tiny tiles. Stop once we have enough rows to overshoot one screen.
         typealias RowEntry = (item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)
         var rows: [(entries: [RowEntry], height: CGFloat)] = []
         var cursor = 0
@@ -230,8 +269,8 @@ private final class LightpaperTiledView: NSView {
                 cursor += 1
 
                 // Settle once the row is short enough both for the aesthetic
-                // target and to keep every image at or below native resolution.
-                if availableWidth / rowAspect <= min(target, minNativeHeight) {
+                // target and to keep the lowest-res image within the upscale bound.
+                if availableWidth / rowAspect <= min(target, minNativeHeight * maxRowUpscale) {
                     settled = true
                     break
                 }
@@ -241,7 +280,7 @@ private final class LightpaperTiledView: NSView {
                 // Ran out of images mid-row; drop this partial row unless it is
                 // all we have, so the bottom never shows a stretched fragment.
                 if rows.isEmpty, !entries.isEmpty {
-                    let height = min(availableWidth / rowAspect, minNativeHeight)
+                    let height = min(availableWidth / rowAspect, minNativeHeight * maxRowUpscale)
                     rows.append((entries, height))
                     totalHeight += height
                 }
@@ -249,8 +288,8 @@ private final class LightpaperTiledView: NSView {
             }
 
             // Natural justified height, capped so the lowest-res image in the row
-            // is never enlarged past its native size.
-            let height = min(availableWidth / rowAspect, minNativeHeight)
+            // is enlarged by at most `maxRowUpscale`× its native size.
+            let height = min(availableWidth / rowAspect, minNativeHeight * maxRowUpscale)
             rows.append((entries, height))
             totalHeight += height
             rowIndex += 1
@@ -273,6 +312,7 @@ private final class LightpaperTiledView: NSView {
         }
 
         frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
+        rebuildTileLayers()
     }
 
     private func appendRow(
@@ -646,7 +686,7 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         if animated {
             gallery.alphaValue = 0
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 1.0
+                context.duration = 1.6
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 gallery.animator().alphaValue = 1
                 previous?.animator().alphaValue = 0
