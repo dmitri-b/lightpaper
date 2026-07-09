@@ -57,7 +57,7 @@ killall legacyScreenSaver legacyScreenSaver-x86_64 WallpaperAgent 2>/dev/null
 Then reopen System Settings > Screen Saver. (Logging out and back in achieves
 the same thing.)
 
-### Build from source
+    ### Build from source
 
 ```sh
 gh repo clone dmitri-b/lightpaper
