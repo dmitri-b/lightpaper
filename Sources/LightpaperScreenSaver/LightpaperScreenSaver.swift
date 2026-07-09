@@ -88,6 +88,13 @@ private let minimumProminentBodyHeightFraction: CGFloat = 0.45
 // goal. 1.0 = the old never-upscale behaviour.
 private let maxRowUpscale: CGFloat = 2.4
 
+// A photo counts as "small" — and gets pushed to the bottom row(s) of the mosaic
+// rather than left in the middle — when its combined size score (native height ×
+// pixel area) falls below this fraction of the screen's median score. One low-res
+// tile in a middle row forces that whole justified row short; corralling the small
+// ones to the bottom keeps the upper rows big.
+private let smallSizeRatio: CGFloat = 0.85
+
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
     private var tileFrames: [NSRect] = []
@@ -105,7 +112,10 @@ private final class LightpaperTiledView: NSView {
         self.items = items
         super.init(frame: NSRect(x: 0, y: 0, width: 1000, height: 1000))
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        // Clear (not black) so that during a staggered reveal the previous gallery
+        // shows through wherever a new tile hasn't faded in yet. Gaps still read as
+        // black because the saver view's own layer is black (commonInit).
+        layer?.backgroundColor = NSColor.clear.cgColor
         imageCache.countLimit = 240
     }
 
@@ -114,6 +124,42 @@ private final class LightpaperTiledView: NSView {
     }
 
     override var isFlipped: Bool { true }
+
+    /// Fades each tile container in on a staggered delay so the mosaic assembles
+    /// in a diagonal wave (top-left first) rather than all at once. Purely
+    /// opacity-based, so nothing moves. Total time ≈ `spread + perTile`.
+    func revealTiles(perTile: CFTimeInterval = 0.8, spread: CFTimeInterval = 0.8) {
+        guard !tileLayers.isEmpty else {
+            return
+        }
+
+        // Order along a diagonal by each tile's top-left corner. The mosaic is a
+        // justified layout (no clean grid), so derive the wave from frame geometry.
+        let diagonals = tileLayers.map { $0.frame.minX + $0.frame.minY }
+        let minD = diagonals.min() ?? 0
+        let maxD = diagonals.max() ?? 0
+        let range = max(maxD - minD, 1)
+
+        let now = CACurrentMediaTime()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, layer) in tileLayers.enumerated() {
+            let position = (diagonals[index] - minD) / range
+            let jitter = CFTimeInterval.random(in: -0.06...0.06)
+            let delay = max(0, CFTimeInterval(position) * spread + jitter)
+
+            layer.opacity = 1
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0
+            fade.toValue = 1
+            fade.duration = perTile
+            fade.beginTime = now + delay
+            fade.fillMode = .backwards
+            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(fade, forKey: "reveal")
+        }
+        CATransaction.commit()
+    }
 
     func appendItems(_ newItems: [TileItem]) {
         guard !newItems.isEmpty else {
@@ -168,7 +214,12 @@ private final class LightpaperTiledView: NSView {
             let container = CALayer()
             container.frame = frame
             container.masksToBounds = true
-            container.backgroundColor = NSColor.black.cgColor
+            // Clear (not black): the aspect-fill image covers the whole container, so
+            // the only time the background shows is before the image has decoded. Black
+            // there made a freshly-revealed tile flash as a black box over the previous
+            // screen during the staggered fade; clear lets the previous screen show
+            // through until the photo lands.
+            container.backgroundColor = NSColor.clear.cgColor
 
             let imageLayer = CALayer()
             imageLayer.frame = container.bounds
@@ -229,39 +280,118 @@ private final class LightpaperTiledView: NSView {
 
     private func updateEditorialLayout(availableWidth: CGFloat, scale: CGFloat) {
         let viewportHeight = viewportHeight()
-        // Tuned for a "looser" mosaic: ~2-3 rows of 3-4 images = ~6-12 large
-        // tiles per screen, so each rendition gets real estate. The high max
-        // clamps matter most — without them no row ever exceeded ~760px tall on a
-        // 4K/5K display, which was the real cap on tile size. Rows still never
-        // exceed the smallest native size in the row, so low-res months simply
-        // pack denser (more, smaller rows) rather than upscaling.
+
+        // 1. Compose the sample as-is to discover exactly which photos fill this
+        //    screen. Only this prefix is displayed; the rest of the (large) sample
+        //    is spare buffer.
+        let firstPass = composeRows(
+            from: items,
+            availableWidth: availableWidth,
+            viewportHeight: viewportHeight,
+            scale: scale
+        )
+        // 2. Sink any row holding a small (low-res) photo to the bottom, so a
+        //    low-res tile never sits in a middle row forcing it short — that short
+        //    row ends up at the bottom instead. Rows of big photos keep their order
+        //    and rhythm on top. Reordering whole composed rows (rather than the
+        //    photos) keeps every tile on screen and each row's packing intact.
+        let rows = sinkSmallRowsLast(firstPass.rows)
+        let totalHeight = firstPass.totalHeight
+
+        // 3. Scale the rows to fill the screen, but only ever downscale. When
+        //    there are enough photos the rows overshoot one screen and shrink to
+        //    fit; when a month (plus spillover) is too small to fill, the bottom
+        //    is left dark rather than upscaling anything.
+        let fill = totalHeight > 0 ? min(1, viewportHeight / totalHeight) : 1
+        var y: CGFloat = 0
+        for row in rows {
+            let height = row.height * fill
+            appendRow(row.entries, y: y, height: height, availableWidth: availableWidth)
+            y += height
+        }
+
+        frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
+        rebuildTileLayers()
+    }
+
+    private typealias RowEntry = (item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)
+    private typealias ComposedRow = (entries: [RowEntry], height: CGFloat)
+
+    /// A photo's "size score" — native height × pixel area, i.e. `width × height²`,
+    /// so height counts twice. Used to spot the low-res tiles that force a row short.
+    private func sizeScore(_ entry: RowEntry) -> CGFloat {
+        entry.nativeHeight * entry.nativeWidth * entry.nativeHeight
+    }
+
+    /// Stable-partitions `rows` so every row containing a small (low-res) photo sinks
+    /// to the bottom, keeping the big-photo rows — and their target-height rhythm — up
+    /// top. "Small" is judged against the screen's *median* size score (robust to a
+    /// lone high-res photo amongst low-res previews, which a max-based cut would
+    /// misread as making all the rest "small"). Whole rows move, so no tile is dropped
+    /// and each row's packing is preserved. When every row (or no row) qualifies the
+    /// order is unchanged.
+    private func sinkSmallRowsLast(_ rows: [ComposedRow]) -> [ComposedRow] {
+        let scores = rows.flatMap { $0.entries.map(sizeScore) }.sorted()
+        guard !scores.isEmpty else {
+            return rows
+        }
+        let median = scores[scores.count / 2]
+        guard median > 0 else {
+            return rows
+        }
+        let cut = median * smallSizeRatio
+
+        var big: [ComposedRow] = []
+        var small: [ComposedRow] = []
+        for row in rows {
+            if row.entries.contains(where: { sizeScore($0) < cut }) {
+                small.append(row)
+            } else {
+                big.append(row)
+            }
+        }
+
+        return big + small
+    }
+
+    /// Packs `source` into justified rows top-down, packing enough images into each
+    /// row that its height never exceeds `maxRowUpscale`× the smallest native size
+    /// in the row — so the lowest-res image is enlarged by at most that factor.
+    /// Low-res photos still end up in denser rows; the headroom is what lets a row
+    /// of modest Lightroom previews stand tall instead of collapsing to tiny tiles.
+    /// Stops once the rows overshoot one screen; returns the rows and their
+    /// unscaled total height.
+    ///
+    /// Tuned for a "looser" mosaic: ~2-3 rows of 3-4 images = ~6-12 large tiles per
+    /// screen, so each rendition gets real estate. The high target clamps matter
+    /// most — without them no row ever exceeded ~760px tall on a 4K/5K display,
+    /// which was the real cap on tile size.
+    private func composeRows(
+        from source: [TileItem],
+        availableWidth: CGFloat,
+        viewportHeight: CGFloat,
+        scale: CGFloat
+    ) -> (rows: [ComposedRow], totalHeight: CGFloat) {
         let targetHeights = [
             min(max(viewportHeight * 0.66, 460), 1300),
             min(max(viewportHeight * 0.50, 360), 1040),
             min(max(viewportHeight * 0.60, 420), 1180),
             min(max(viewportHeight * 0.46, 320), 940)
         ]
-        // 1. Compose justified rows, packing enough images into each row that its
-        //    height never exceeds `maxRowUpscale`× the smallest native size in the
-        //    row — so the lowest-res image is enlarged by at most that factor.
-        //    Low-res photos still end up in denser rows; the headroom is what lets
-        //    a row of modest Lightroom previews stand tall instead of collapsing
-        //    to tiny tiles. Stop once we have enough rows to overshoot one screen.
-        typealias RowEntry = (item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)
-        var rows: [(entries: [RowEntry], height: CGFloat)] = []
+        var rows: [ComposedRow] = []
         var cursor = 0
         var rowIndex = 0
         var totalHeight: CGFloat = 0
 
-        while cursor < items.count {
+        while cursor < source.count {
             var entries: [RowEntry] = []
             var rowAspect: CGFloat = 0
             var minNativeHeight = CGFloat.greatestFiniteMagnitude
             let target = targetHeights[rowIndex % targetHeights.count]
             var settled = false
 
-            while cursor < items.count {
-                let item = items[cursor]
+            while cursor < source.count {
+                let item = source[cursor]
                 let size = nativeSize(for: item, scale: scale)
                 entries.append((item, size.width, size.height))
                 rowAspect += size.width / size.height
@@ -299,20 +429,7 @@ private final class LightpaperTiledView: NSView {
             }
         }
 
-        // 2. Scale the rows to fill the screen, but only ever downscale. When
-        //    there are enough photos the rows overshoot one screen and shrink to
-        //    fit; when a month (plus spillover) is too small to fill, the bottom
-        //    is left dark rather than upscaling anything.
-        let fill = totalHeight > 0 ? min(1, viewportHeight / totalHeight) : 1
-        var y: CGFloat = 0
-        for row in rows {
-            let height = row.height * fill
-            appendRow(row.entries, y: y, height: height, availableWidth: availableWidth)
-            y += height
-        }
-
-        frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
-        rebuildTileLayers()
+        return (rows, totalHeight)
     }
 
     private func appendRow(
@@ -544,7 +661,7 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     private func commonInit() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        animationTimeInterval = isPreview ? 6 : 9
+        animationTimeInterval = isPreview ? 11 : 14
     }
 
     private func buildCatalog() {
@@ -683,14 +800,17 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         let previous = currentGallery
         currentGallery = gallery
 
-        if animated {
-            gallery.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 1.6
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                gallery.animator().alphaValue = 1
-                previous?.animator().alphaValue = 0
-            } completionHandler: {
+        if animated, let tiledView = gallery.documentView as? LightpaperTiledView {
+            // Assemble the new mosaic tile-by-tile in a diagonal wave. The new
+            // gallery is transparent (makeGallery sets drawsBackground = false), so
+            // the previous screen shows through and is replaced region-by-region as
+            // tiles land. Remove the old gallery once the wave completes.
+            let perTile: CFTimeInterval = 0.8
+            let spread: CFTimeInterval = 0.8
+            tiledView.revealTiles(perTile: perTile, spread: spread)
+            // Remove the old gallery once the last tile has finished landing
+            // (+ a small buffer to cover the per-tile jitter).
+            DispatchQueue.main.asyncAfter(deadline: .now() + spread + perTile + 0.1) {
                 previous?.removeFromSuperview()
             }
         } else {
@@ -701,8 +821,12 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     private func makeGallery(items: [TileItem]) -> NSScrollView {
         let tiledView = LightpaperTiledView(items: items)
         let scrollView = NSScrollView(frame: bounds)
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .black
+        // Transparent so a freshly-presented gallery reveals over (and replaces) the
+        // previous screen during the staggered tile fade. Gaps read as black because
+        // the saver view's own layer is black (commonInit).
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.contentView.drawsBackground = false
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
