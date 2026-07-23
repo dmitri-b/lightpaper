@@ -23,10 +23,21 @@ cask "lightpaper" do
 
   screen_saver "Lightpaper.saver"
 
+  # macOS caches the loaded screen saver bundle, so after an in-place upgrade
+  # the old version keeps activating on idle until these agents are bounced.
+  # Both relaunch on demand, so killing them is harmless.
+  postflight do
+    system_command "/usr/bin/killall", args: ["legacyScreenSaver"], sudo: false
+    system_command "/usr/bin/killall", args: ["WallpaperAgent"],    sudo: false
+  end
+
   caveats <<~EOS
     Lightpaper is not notarized. If macOS blocks it, clear the quarantine flag:
       xattr -dr com.apple.quarantine "~/Library/Screen Savers/Lightpaper.saver"
 
     Then choose Lightpaper in System Settings > Screen Saver.
+
+    If a previously-running version still appears on idle after upgrading,
+    log out and back in (or reboot) to force macOS to reload the bundle.
   EOS
 end
