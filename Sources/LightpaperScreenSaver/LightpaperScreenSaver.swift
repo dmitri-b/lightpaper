@@ -53,6 +53,17 @@ private let photosPerScreen = 140
 // there are still enough left to fill the screen from that one month. The layout
 // uses only what it needs and ignores the surplus.
 private let sampleCandidateLimit = 240
+
+// How many tiles `deduplicateByLook` keeps before it stops analysing. This is a
+// buffer, not a target: `composeRows` stops consuming items the moment its rows
+// overshoot the viewport, which on a real screen happens after ~6-20 tiles (rows
+// are capped at `maxRowUpscale`× the smallest native size, so they stay tall and
+// few). Everything analysed past that point is thrown away — and analysis is by
+// far the most expensive thing the saver does, at ~130ms of Vision work per
+// photo. Walking the whole `sampleCandidateLimit` buffer therefore spent ~30s
+// per screen to show a dozen photos. A generous multiple of the worst realistic
+// case keeps the layout from ever running short while cutting most of that cost.
+private let keptTilesPerScreen = 60
 // Only previews whose long edge is at least this many pixels are eligible, so
 // enlarged mosaic tiles stay reasonably crisp. 640 covers most months.
 private let minimumRenditionLongSide = 640.0
@@ -620,6 +631,15 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     // Keep the indexing screen (which shows the version) up long enough to read,
     // even when the cached index loads almost instantly.
     private let minimumIndexingDuration: TimeInterval = 2.5
+    // Earliest time the next screen may start being prepared, set when a gallery
+    // is actually presented. `animationTimeInterval` alone only paces when work
+    // *starts*: preparing a screen takes real time, so a tick that lands mid-pass
+    // is dropped by `isSwapping` and the following one fires almost immediately
+    // after the pass ends. The saver then spends nearly all its time preparing
+    // screens rather than resting on one — which is the whole point when it is
+    // installed as a wallpaper and runs for days. Measuring the interval from
+    // presentation makes it a true dwell time.
+    private var nextSwapAllowedAt: Date = .distantPast
 
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -648,7 +668,38 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     }
 
     public override func animateOneFrame() {
+        guard isVisibleToSomeone else {
+            return
+        }
+        guard Date() >= nextSwapAllowedAt else {
+            return
+        }
         showNextMonth(animated: true)
+    }
+
+    /// Whether producing a new screen could actually be seen.
+    ///
+    /// Two cases, both of which the saver used to keep working through:
+    ///
+    /// - No window. A view the host has detached is never coming back on screen,
+    ///   and several such views accumulate over a long session — without this they
+    ///   each keep answering their own timer, so the process pays for a screen
+    ///   nobody will ever look at, several times over.
+    /// - Occluded. As a wallpaper this runs for the entire login session, and for
+    ///   most of that session the desktop is completely covered by app windows.
+    ///   `occlusionState` is the system's own answer to whether any part of the
+    ///   window is actually showing, and it is what stops a wallpaper from
+    ///   spending 130ms of Vision work per photo compositing a mosaic behind a
+    ///   full-screen editor.
+    ///
+    /// Skipping rather than stopping keeps this cheap to get wrong: the current
+    /// screen simply stays up, and the next tick after the desktop is revealed
+    /// swaps it. Nothing needs to be restarted.
+    private var isVisibleToSomeone: Bool {
+        guard let window, window.isVisible else {
+            return false
+        }
+        return window.occlusionState.contains(.visible)
     }
 
     public override func layout() {
@@ -669,27 +720,9 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         showIndexingAnimation()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let accounts = findCatalogAccounts()
-            var catalog = buildMonthCatalog(accounts: accounts, minLongSide: minimumRenditionLongSide)
-
-            if let catalog {
-                // Persist the index whenever Lightroom's previews.db is readable,
-                // so we can keep grouping by month later.
-                saveCatalogCache(catalog)
-            } else {
-                // previews.db is gone (Lightroom removes it while running). Reuse
-                // the last index we saved so screens stay grouped by month instead
-                // of dropping to random sampling.
-                catalog = loadCatalogCache()
-            }
-
-            // Fall back to whole-library random sampling only if neither a fresh
-            // nor a cached catalog is available, so the saver still shows something.
-            var pool: [URL] = []
-            if catalog == nil {
-                let sources = collectSourceDirectories()
-                pool = collectCandidateURLs(from: sources, limit: defaultImageLimit, excluding: [])
-            }
+            let index = CatalogStore.shared.load()
+            let catalog = index.catalog
+            let pool = index.fallbackPool
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else {
@@ -777,7 +810,9 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
             }
         }
 
-        return Array(result.prefix(sampleCandidateLimit))
+        // Promote to URL only here, for the bounded sample that is actually about
+        // to be read — the index itself stays as strings (see `MonthCatalog`).
+        return result.prefix(sampleCandidateLimit).map { URL(fileURLWithPath: $0) }
     }
 
     private func randomMonth(excluding excluded: String?, from months: [String]) -> String {
@@ -789,6 +824,11 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     }
 
     private func presentGallery(items: [TileItem], animated: Bool) {
+        // Start the dwell clock from the moment a screen goes up, not from when
+        // work began. Deliberately not set on the paths that bail out before
+        // presenting (no sample, or everything deduped away) so those retry on the
+        // next tick instead of idling for a full interval on a blank screen.
+        nextSwapAllowedAt = Date().addingTimeInterval(animationTimeInterval)
         hideIndexingAnimation()
 
         let gallery = makeGallery(items: items)
@@ -863,19 +903,97 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
 
 // MARK: - Lightroom catalog (month index)
 
-/// Preview URLs grouped by capture month ("YYYY-MM"), read from the Lightroom
+/// Preview paths grouped by capture month ("YYYY-MM"), read from the Lightroom
 /// catalog. The capture date is not stored in the preview files themselves
 /// (they are hash-named and EXIF-stripped), so it is recovered from the
 /// `Managed Catalog.mcat` SQLite database and joined to on-disk previews via
 /// `previews.db`.
+///
+/// Paths are held as `String`, not `URL`, and promoted to `URL` only for the
+/// ~240 that are actually sampled for a screen. A Swift `URL` is a cluster of
+/// five heap objects here (`URLParseInfo`, `_SwiftURL`, two lock buffers and a
+/// `ResourceInfo`) totalling ~600 bytes against ~200 for the equivalent string,
+/// so at library scale the representation is worth about 3× the whole index.
 private struct MonthCatalog {
     let months: [String]
-    let pathsByMonth: [String: [URL]]
+    let pathsByMonth: [String: [String]]
 }
 
-/// On-disk form of `MonthCatalog` (URLs flattened to paths) so the last good
-/// index survives across launches — and across periods when Lightroom is running
-/// and has removed `previews.db`.
+/// The month index, built at most once per process and shared by every saver
+/// view.
+///
+/// `legacyScreenSaver` hosts the saver for the whole login session and creates a
+/// fresh view for each display, wake and wallpaper refresh — without reliably
+/// releasing the previous ones. After two days of wallpaper use, 17 live
+/// `LightpaperScreenSaverView` instances were observed in a single process. When
+/// each one owned its own copy of the index that leak was multiplied by the size
+/// of the library: 29,503 previews became 501,551 retained path objects and
+/// ~300MB of the process's 452MB footprint.
+///
+/// Sharing one index makes a leaked view cost a pointer rather than a copy of the
+/// library, and — because building it means a full SQLite pass over `previews.db`
+/// and every asset row in the catalog — collapses that work from once per view to
+/// once per process. The view leak itself belongs to the host and is not ours to
+/// fix; this makes it cheap instead of ruinous.
+private final class CatalogStore {
+    struct Index {
+        let catalog: MonthCatalog?
+        /// Whole-library random sampling, populated only when no catalog could be
+        /// built or loaded, so the saver still shows something.
+        let fallbackPool: [URL]
+    }
+
+    static let shared = CatalogStore()
+
+    private let lock = NSLock()
+    private var index: Index?
+
+    /// Blocking, and safe to call from several views at once: the first caller
+    /// builds the index while the rest wait on the lock and are handed the same
+    /// result. Callers are already on a background queue.
+    func load() -> Index {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let index {
+            return index
+        }
+
+        var catalog = buildMonthCatalog(
+            accounts: findCatalogAccounts(),
+            minLongSide: minimumRenditionLongSide
+        )
+
+        if let catalog {
+            // Persist the index whenever Lightroom's previews.db is readable,
+            // so we can keep grouping by month later.
+            saveCatalogCache(catalog)
+        } else {
+            // previews.db is gone (Lightroom removes it while running). Reuse
+            // the last index we saved so screens stay grouped by month instead
+            // of dropping to random sampling.
+            catalog = loadCatalogCache()
+        }
+
+        var pool: [URL] = []
+        if catalog == nil {
+            pool = collectCandidateURLs(
+                from: collectSourceDirectories(),
+                limit: defaultImageLimit,
+                excluding: []
+            )
+        }
+
+        let built = Index(catalog: catalog, fallbackPool: pool)
+        index = built
+        return built
+    }
+}
+
+/// On-disk form of `MonthCatalog` so the last good index survives across
+/// launches — and across periods when Lightroom is running and has removed
+/// `previews.db`. Structurally identical to `MonthCatalog` now that the in-memory
+/// index also holds paths as strings.
 private struct CachedCatalog: Codable {
     let months: [String]
     let pathsByMonth: [String: [String]]
@@ -898,7 +1016,7 @@ private func saveCatalogCache(_ catalog: MonthCatalog) {
     }
     let payload = CachedCatalog(
         months: catalog.months,
-        pathsByMonth: catalog.pathsByMonth.mapValues { $0.map(\.path) }
+        pathsByMonth: catalog.pathsByMonth
     )
     do {
         try FileManager.default.createDirectory(
@@ -921,10 +1039,7 @@ private func loadCatalogCache() -> MonthCatalog? {
           !payload.months.isEmpty else {
         return nil
     }
-    let pathsByMonth = payload.pathsByMonth.mapValues { paths in
-        paths.map { URL(fileURLWithPath: $0) }
-    }
-    return MonthCatalog(months: payload.months, pathsByMonth: pathsByMonth)
+    return MonthCatalog(months: payload.months, pathsByMonth: payload.pathsByMonth)
 }
 
 /// Account folders that contain both the rendition map and the catalog.
@@ -1009,7 +1124,7 @@ private func captureMonth(in bytes: UnsafeRawBufferPointer) -> String? {
 }
 
 private func buildMonthCatalog(accounts: [URL], minLongSide: Double) -> MonthCatalog? {
-    var pathsByMonth: [String: [URL]] = [:]
+    var pathsByMonth: [String: [String]] = [:]
 
     for account in accounts {
         let previewsURL = account.appendingPathComponent("previews.db")
@@ -1071,7 +1186,7 @@ private func buildMonthCatalog(accounts: [URL], minLongSide: Double) -> MonthCat
                 guard let month, !month.hasPrefix("0000") else {
                     continue
                 }
-                pathsByMonth[month, default: []].append(URL(fileURLWithPath: path))
+                pathsByMonth[month, default: []].append(path)
             }
         }
         sqlite3_finalize(assetStmt)
@@ -1243,20 +1358,74 @@ private struct PhotoAnalysis {
     let hasProminentPerson: Bool
 }
 
+private final class CachedAnalysis {
+    let analysis: PhotoAnalysis
+
+    init(_ analysis: PhotoAnalysis) {
+        self.analysis = analysis
+    }
+}
+
+/// Analysis results keyed by preview path. Lightroom's preview files are
+/// content-addressed — hash-named and never rewritten in place — so a path is a
+/// stable key for the analysis of its pixels, with no need to stat for staleness.
+/// This is what makes repeat screens cheap: months are picked at random from a
+/// fixed set and `nextSampleURLs` deliberately overruns into neighbouring months,
+/// so the same photos come back around every few screens and would otherwise pay
+/// full Vision cost each time.
+///
+/// Sized to cover the library rather than a few recent screens. Months are picked
+/// at random from ~120, so a cache holding only a couple of dozen months' worth is
+/// nearly always cold by the time a month comes round again — the hit rate tracks
+/// what fraction of the library fits, not how recently anything was used. A
+/// 768-dim print is ~3KB, so a 29,503-preview library is ~90MB if fully resident;
+/// the byte limit caps that at 64MB and `NSCache` sheds entries under memory
+/// pressure regardless. A miss simply costs what it always cost.
+private let analysisCache: NSCache<NSString, CachedAnalysis> = {
+    let cache = NSCache<NSString, CachedAnalysis>()
+    cache.countLimit = 20_000
+    cache.totalCostLimit = 64 * 1024 * 1024
+    return cache
+}()
+
+/// Approximate resident size of one cached entry: a 768-element float feature
+/// print plus object overhead.
+private let analysisCacheEntryCost = 768 * MemoryLayout<Float>.size + 1024
+
 /// Decodes the image once (a small thumbnail) and runs the Vision requests it
 /// needs in a single pass. The feature print is always computed; face and body
 /// detection only run when `detectPeople` is set, so default behaviour keeps the
 /// exact same cost. Distances between feature prints reflect how alike the
 /// scenes/subjects look (not just composition), so frames from the same shoot
-/// land close together.
+/// land close together. Results are memoised in `analysisCache`.
 private func analyzePhoto(at url: URL, detectPeople: Bool) -> PhotoAnalysis {
+    // Face/body detection only runs when asked for, so an entry cached without it
+    // can't answer a `detectPeople` query — key the two variants apart rather than
+    // let a privacy-mode lookup hit an entry that never ran the detectors.
+    let cacheKey = "\(url.path)\(detectPeople ? "\u{0}people" : "")" as NSString
+    if let cached = analysisCache.object(forKey: cacheKey) {
+        return cached.analysis
+    }
+
+    // Memoise failures too: `loadTileItem` has already opened the file, so a
+    // failure here means the file is unreadable rather than absent, and retrying
+    // it on every screen would re-pay the decode to fail again.
+    func remember(_ analysis: PhotoAnalysis) -> PhotoAnalysis {
+        analysisCache.setObject(
+            CachedAnalysis(analysis),
+            forKey: cacheKey,
+            cost: analysisCacheEntryCost
+        )
+        return analysis
+    }
+
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
           let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
               kCGImageSourceCreateThumbnailFromImageAlways: true,
               kCGImageSourceThumbnailMaxPixelSize: 360,
               kCGImageSourceShouldCache: false
           ] as CFDictionary) else {
-        return PhotoAnalysis(featurePrint: nil, hasProminentPerson: false)
+        return remember(PhotoAnalysis(featurePrint: nil, hasProminentPerson: false))
     }
 
     let printRequest = VNGenerateImageFeaturePrintRequest()
@@ -1279,10 +1448,10 @@ private func analyzePhoto(at url: URL, detectPeople: Bool) -> PhotoAnalysis {
         (faceRequest?.results ?? []).contains { $0.boundingBox.height >= minimumProminentFaceHeightFraction }
         || (bodyRequest?.results ?? []).contains { $0.boundingBox.height >= minimumProminentBodyHeightFraction }
 
-    return PhotoAnalysis(
+    return remember(PhotoAnalysis(
         featurePrint: printRequest.results?.first as? VNFeaturePrintObservation,
         hasProminentPerson: prominent
-    )
+    ))
 }
 
 /// Drops tiles that look near-identical to one already kept, preserving order so
@@ -1292,11 +1461,24 @@ private func analyzePhoto(at url: URL, detectPeople: Bool) -> PhotoAnalysis {
 /// we couldn't compare — but a confirmed prominent person is always dropped.
 /// Vision requests run here, on the background queue that calls this, and never
 /// escape — so `TileItem` stays cheap and `Sendable`.
-private func deduplicateByLook(_ items: [TileItem], hidePeople: Bool) -> [TileItem] {
+///
+/// Stops as soon as `limit` tiles survive. `items` is a deliberately oversized
+/// buffer (see `sampleCandidateLimit`) sized for the worst case where a month is
+/// nearly all look-alikes; when it isn't, the tail is surplus the layout would
+/// never place, so analysing it is pure waste. Running short is already handled
+/// downstream — the layout only ever downscales — so a bounded prefix is safe.
+private func deduplicateByLook(
+    _ items: [TileItem],
+    hidePeople: Bool,
+    limit: Int = keptTilesPerScreen
+) -> [TileItem] {
     var kept: [TileItem] = []
     var keptPrints: [VNFeaturePrintObservation] = []
 
     for item in items {
+        guard kept.count < limit else {
+            break
+        }
         let analysis = analyzePhoto(at: item.url, detectPeople: hidePeople)
         if hidePeople && analysis.hasProminentPerson {
             continue
