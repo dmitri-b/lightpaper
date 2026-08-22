@@ -668,39 +668,12 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     }
 
     public override func animateOneFrame() {
-        guard isVisibleToSomeone else {
-            return
-        }
         guard Date() >= nextSwapAllowedAt else {
             return
         }
         showNextMonth(animated: true)
     }
 
-    /// Whether producing a new screen could actually be seen.
-    ///
-    /// Two cases, both of which the saver used to keep working through:
-    ///
-    /// - No window. A view the host has detached is never coming back on screen,
-    ///   and several such views accumulate over a long session — without this they
-    ///   each keep answering their own timer, so the process pays for a screen
-    ///   nobody will ever look at, several times over.
-    /// - Occluded. As a wallpaper this runs for the entire login session, and for
-    ///   most of that session the desktop is completely covered by app windows.
-    ///   `occlusionState` is the system's own answer to whether any part of the
-    ///   window is actually showing, and it is what stops a wallpaper from
-    ///   spending 130ms of Vision work per photo compositing a mosaic behind a
-    ///   full-screen editor.
-    ///
-    /// Skipping rather than stopping keeps this cheap to get wrong: the current
-    /// screen simply stays up, and the next tick after the desktop is revealed
-    /// swaps it. Nothing needs to be restarted.
-    private var isVisibleToSomeone: Bool {
-        guard let window, window.isVisible else {
-            return false
-        }
-        return window.occlusionState.contains(.visible)
-    }
 
     public override func layout() {
         super.layout()
