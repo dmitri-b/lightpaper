@@ -64,6 +64,18 @@ private let sampleCandidateLimit = 240
 // per screen to show a dozen photos. A generous multiple of the worst realistic
 // case keeps the layout from ever running short while cutting most of that cost.
 private let keptTilesPerScreen = 60
+
+// How many recently shown months to remember and refuse to show again. Months are
+// picked uniformly at random, so remembering only the previous one leaves the
+// birthday problem to run its course: with ~138 months there is a 50% chance of
+// repeating a month within 15 screens (~4 minutes), and a 30-minute idle spends
+// ~44 of its 128 screens on months it has already shown. Because a screen places
+// only ~9 tiles, a repeated month is often a near-identical screen — the small
+// months (15 of them hold under 10 photos) simply replay in full. A window of
+// this size pushes the earliest possible repeat out to ~40 screens (~10 minutes)
+// and, being persisted, survives the view churn and process restarts that used to
+// reset the one-month memory constantly.
+private let recentMonthMemory = 40
 // Only previews whose long edge is at least this many pixels are eligible, so
 // enlarged mosaic tiles stay reasonably crisp. 640 covers most months.
 private let minimumRenditionLongSide = 640.0
@@ -623,7 +635,6 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
     private var currentGallery: NSScrollView?
     private var monthCatalog: MonthCatalog?
     private var fallbackPool: [URL] = []
-    private var lastMonth: String?
     private var isLoading = false
     private var isSwapping = false
     private var didStart = false
@@ -759,8 +770,10 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         // back to the normal random pick when unset or the month isn't present.
         let forcedMonth = ProcessInfo.processInfo.environment["LIGHTPAPER_FORCE_MONTH"]
             .flatMap { months.contains($0) ? $0 : nil }
-        let month = forcedMonth ?? randomMonth(excluding: lastMonth, from: months)
-        lastMonth = month
+        // A forced month is not recorded: pinning every screen to one month would
+        // otherwise fill the recent-months window with it and throw away the real
+        // history for the next normal run.
+        let month = forcedMonth ?? pickMonth(from: months)
 
         var result = (catalog.pathsByMonth[month] ?? []).shuffled()
         // Top the candidate pool up to the full dedup buffer (sampleCandidateLimit),
@@ -788,12 +801,16 @@ public final class LightpaperScreenSaverView: ScreenSaverView {
         return result.prefix(sampleCandidateLimit).map { URL(fileURLWithPath: $0) }
     }
 
-    private func randomMonth(excluding excluded: String?, from months: [String]) -> String {
-        guard months.count > 1, let excluded else {
-            return months.randomElement() ?? months[0]
-        }
-        let candidates = months.filter { $0 != excluded }
-        return candidates.randomElement() ?? months[0]
+    /// Picks a month at random from those not shown recently, and records it as
+    /// shown. Falls back to an unfiltered pick when the window leaves no
+    /// candidates — a one-month library, say — so a screen is always produced.
+    private func pickMonth(from months: [String]) -> String {
+        let store = RecentMonthsStore.shared
+        let excluded = store.recentlyShown(outOf: months.count)
+        let candidates = months.filter { !excluded.contains($0) }
+        let month = candidates.randomElement() ?? months.randomElement() ?? months[0]
+        store.record(month)
+        return month
     }
 
     private func presentGallery(items: [TileItem], animated: Bool) {
@@ -963,6 +980,82 @@ private final class CatalogStore {
     }
 }
 
+/// The months shown most recently, so the picker can avoid repeating them.
+///
+/// Shared by every saver view for the same reason `CatalogStore` is: the host
+/// creates a view per display, wake and wallpaper refresh, so per-view memory is
+/// wiped constantly and two displays would otherwise be free to land on the same
+/// month at the same moment. One shared window covers both. It is persisted for
+/// the same reason — a memory that resets whenever the process does is no memory
+/// at all for a saver that is restarted several times a day.
+///
+/// Oldest first; only the last `recentMonthMemory` entries are kept.
+private final class RecentMonthsStore {
+    static let shared = RecentMonthsStore()
+
+    private let lock = NSLock()
+    private var loaded = false
+    private var recent: [String] = []
+
+    /// The months to keep off screen right now. Capped at half the library so
+    /// there is always a healthy pool left to draw from, however small the
+    /// library or however large `recentMonthMemory` grows.
+    func recentlyShown(outOf monthCount: Int) -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        loadIfNeeded()
+
+        let window = min(recentMonthMemory, max(1, monthCount / 2))
+        return Set(recent.suffix(window))
+    }
+
+    func record(_ month: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        loadIfNeeded()
+
+        recent.removeAll { $0 == month }
+        recent.append(month)
+        if recent.count > recentMonthMemory {
+            recent.removeFirst(recent.count - recentMonthMemory)
+        }
+        persist()
+    }
+
+    private func loadIfNeeded() {
+        guard !loaded else {
+            return
+        }
+        loaded = true
+        guard let url = storeURL(),
+              let data = try? Data(contentsOf: url),
+              let months = try? JSONDecoder().decode([String].self, from: data) else {
+            return
+        }
+        recent = months.suffix(recentMonthMemory)
+    }
+
+    /// Best-effort, and deliberately unthrottled: the file is a few hundred bytes
+    /// and a screen changes at most every `animationTimeInterval`, so writing on
+    /// every pick costs nothing measurable and keeps the window exact across a
+    /// crash or a hard restart. Failures are ignored — a lost window just means
+    /// the old, more repetitive behaviour until it is rebuilt.
+    private func persist() {
+        guard let url = storeURL(), let data = try? JSONEncoder().encode(recent) else {
+            return
+        }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func storeURL() -> URL? {
+        cacheFileURL("recent-months.json")
+    }
+}
+
 /// On-disk form of `MonthCatalog` so the last good index survives across
 /// launches — and across periods when Lightroom is running and has removed
 /// `previews.db`. Structurally identical to `MonthCatalog` now that the in-memory
@@ -972,13 +1065,20 @@ private struct CachedCatalog: Codable {
     let pathsByMonth: [String: [String]]
 }
 
-private func catalogCacheURL() -> URL? {
+/// A file in the saver's own cache directory. Note that under the
+/// `legacyScreenSaver` host this resolves inside that host's container, not the
+/// user's top-level `~/Library/Caches`.
+private func cacheFileURL(_ name: String) -> URL? {
     guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
         return nil
     }
     return caches
         .appendingPathComponent("dev.lightpaper.Lightpaper", isDirectory: true)
-        .appendingPathComponent("month-catalog.json")
+        .appendingPathComponent(name)
+}
+
+private func catalogCacheURL() -> URL? {
+    cacheFileURL("month-catalog.json")
 }
 
 /// Best-effort: writes the freshly built index to disk so it can be reused while
