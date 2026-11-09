@@ -83,13 +83,15 @@ private let minimumRenditionLongSide = 640.0
 // scene/subject) and are not placed on one screen together. Feature prints are a
 // 768-dim on-device semantic embedding, so unlike a difference hash they group
 // "same shoot, different pose" portraits — exactly the look-alikes that made
-// dense months look repetitive. Measured on real months: genuine look-alikes sit
-// below ~0.5; genuinely distinct scenes sit well above. Tuned on real months:
-// 0.7 cuts a one-shoot month (61 near-identical portraits) down to ~16 varied
-// frames while a varied travel month still keeps ~26 distinct scenes, because a
-// semantic threshold naturally prunes monotony harder than variety. Lower = more
-// aggressive removal.
-private let nearDuplicateFeaturePrintDistance: Float = 0.7
+// dense months look repetitive. Tuned on real months: 0.7 cuts a one-shoot month
+// (61 near-identical portraits) down to ~16 varied frames while a varied travel
+// month still keeps ~26 distinct scenes, because a semantic threshold naturally
+// prunes monotony harder than variety. Since the layout picks each screen from the
+// whole de-duplicated buffer, pairs just above 0.7 still landed side by side; on 32
+// real months nearly every kept pair at 0.70–0.75 was the same moment twice (same
+// cat on the same bench, the same sunset reframed), while pairs from 0.75 up are
+// different shots of a place or person. Higher = more aggressive removal.
+private let nearDuplicateFeaturePrintDistance: Float = 0.75
 
 // Privacy mode: a photo counts as "about a person" when a detected face or body
 // box is at least this tall relative to the frame, so headshots and posed shots
