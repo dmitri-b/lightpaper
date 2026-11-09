@@ -381,39 +381,58 @@ private final class LightpaperTiledView: NSView {
     }
 
     /// The left-to-right order of `row` with the fewest tile edges lining up with
-    /// the row above (`avoiding`), keeping the sample order on ties. Rows longer
-    /// than six photos are left as they are (their seams are already dense).
+    /// the row above (`avoiding`), keeping the sample order on ties.
     private func arrangeRow(_ row: [TileItem], avoiding previousSeams: [CGFloat]) -> [TileItem] {
-        guard !previousSeams.isEmpty, row.count > 1, row.count <= 6 else {
-            return row
+        bestArrangement(row.map(aspect), avoiding: previousSeams).order.map { row[$0] }
+    }
+
+    /// The order (as indices into `aspects`) that puts the fewest tile edges within
+    /// reach of `previousSeams`, and that count. The given order is tried first and
+    /// only strictly better ones replace it; orders that differ only by swapping
+    /// photos of the same shape are skipped, since their edges are identical.
+    private func bestArrangement(_ aspects: [CGFloat], avoiding previousSeams: [CGFloat]) -> (order: [Int], aligned: Int) {
+        let identity = Array(aspects.indices)
+        guard !previousSeams.isEmpty, aspects.count > 1 else {
+            return (identity, 0)
         }
-        func alignedSeams(_ order: [TileItem]) -> Int {
-            seamPositions(order.map(aspect)).filter { seam in
-                previousSeams.contains { abs($0 - seam) < 0.04 }
-            }.count
+        let total = aspects.reduce(0, +)
+        func aligned(_ order: [Int]) -> Int {
+            var running: CGFloat = 0
+            var count = 0
+            for index in order.dropLast() {
+                running += aspects[index]
+                let seam = running / total
+                if previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
+                    count += 1
+                }
+            }
+            return count
         }
-        var best = row
-        var bestAligned = alignedSeams(row)
-        var order = row
-        func permute(_ k: Int) {
-            guard bestAligned > 0 else {
+        var best = (order: identity, aligned: aligned(identity))
+        var order: [Int] = []
+        var used = [Bool](repeating: false, count: aspects.count)
+        func permute() {
+            guard best.aligned > 0 else {
                 return
             }
-            if k == order.count {
-                let aligned = alignedSeams(order)
-                if aligned < bestAligned {
-                    bestAligned = aligned
-                    best = order
+            if order.count == aspects.count {
+                let value = aligned(order)
+                if value < best.aligned {
+                    best = (order, value)
                 }
                 return
             }
-            for i in k..<order.count {
-                order.swapAt(k, i)
-                permute(k + 1)
-                order.swapAt(k, i)
+            var tried: [CGFloat] = []
+            for index in aspects.indices where !used[index] && !tried.contains(aspects[index]) {
+                tried.append(aspects[index])
+                used[index] = true
+                order.append(index)
+                permute()
+                order.removeLast()
+                used[index] = false
             }
         }
-        permute(0)
+        permute()
         return best
     }
 
@@ -428,10 +447,10 @@ private final class LightpaperTiledView: NSView {
     /// Indices into `aspects` of the photos (at most `maxPhotosPerRow`) that best fill
     /// a row of aspect `target`. Mostly that is the aspect sum closest to the target
     /// (which is what keeps tiles uncropped); as lighter tie-breaks it prefers about
-    /// `perRow` photos and tile edges that don't line up with the row above
-    /// (`avoiding`), since stacked seams read as a rigid grid rather than a mosaic.
-    /// Depth-first in sample order, replacing the best only on strict improvement,
-    /// so ties keep the earlier — more random — photos.
+    /// `perRow` photos and tile edges that — in the set's best arrangement — don't
+    /// line up with the row above (`avoiding`), since stacked seams read as a rigid
+    /// grid rather than a mosaic. Depth-first in sample order, replacing the best only
+    /// on strict improvement, so ties keep the earlier — more random — photos.
     private func fitRow(_ aspects: [CGFloat], target: CGFloat, perRow: CGFloat, avoiding previousSeams: [CGFloat]) -> [Int] {
         var best: [Int] = []
         var bestCost = CGFloat.greatestFiniteMagnitude
@@ -444,16 +463,9 @@ private final class LightpaperTiledView: NSView {
         func cost(sum: CGFloat) -> CGFloat {
             var value = abs(sum - target) / target
             value += countWeight * abs(CGFloat(current.count) - perRow) / perRow
-            // Only worth checking seams when this subset could still win.
+            // Only worth arranging when this subset could still win.
             if !previousSeams.isEmpty, value < bestCost {
-                var running: CGFloat = 0
-                for index in current.dropLast() {
-                    running += aspects[index]
-                    let seam = running / sum
-                    if previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
-                        value += 0.04
-                    }
-                }
+                value += 0.04 * CGFloat(bestArrangement(current.map { aspects[$0] }, avoiding: previousSeams).aligned)
             }
             return value
         }
