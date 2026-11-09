@@ -113,7 +113,7 @@ private let preferredPhotosPerScreen: CGFloat = 10
 // row, and the most it will put in one row. Looking ahead lets each row be built
 // from photos whose combined aspect ratio matches the row almost exactly, so rows
 // fill the screen width at the target height with next to no cropping.
-private let rowLookahead = 16
+private let rowLookahead = 24
 private let maxPhotosPerRow = 7
 
 private final class LightpaperTiledView: NSView {
@@ -413,6 +413,8 @@ private final class LightpaperTiledView: NSView {
             return value
         }
 
+        let widest = aspects.max() ?? 0
+
         func search(from start: Int, sum: CGFloat) {
             if !current.isEmpty {
                 let value = cost(sum: sum)
@@ -421,11 +423,17 @@ private final class LightpaperTiledView: NSView {
                     best = current
                 }
             }
-            // Adding a photo past `perRow` can only raise the count penalty, so stop
-            // once that alone exceeds the best cost found.
-            let nextCount = CGFloat(current.count + 1)
-            guard current.count < maxPhotosPerRow, sum < target,
-                  nextCount <= perRow || 0.03 * (nextCount - perRow) / perRow < bestCost else {
+            // Photos past `perRow` only raise the count penalty, so the count that can
+            // still beat the best is bounded; and if even that many of the widest
+            // remaining photos can't get close enough to the target, no subset below
+            // this one can win.
+            let countLimit = min(
+                CGFloat(maxPhotosPerRow),
+                bestCost == .greatestFiniteMagnitude ? .greatestFiniteMagnitude : perRow + bestCost * perRow / 0.03
+            )
+            let slots = min(countLimit - CGFloat(current.count), CGFloat(aspects.count - start))
+            guard slots >= 1, sum < target,
+                  (target - (sum + slots * widest)) / target < bestCost else {
                 return
             }
             for index in start..<aspects.count {
