@@ -448,7 +448,7 @@ private final class LightpaperTiledView: NSView {
             if !previousSeams.isEmpty, value < bestCost {
                 let seams = seamPositions(current.map { aspects[$0] })
                 for seam in seams where previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
-                    value += 0.01
+                    value += 0.04
                 }
             }
             return value
