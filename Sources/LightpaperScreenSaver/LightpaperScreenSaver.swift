@@ -411,11 +411,17 @@ private final class LightpaperTiledView: NSView {
         var best = (order: identity, aligned: aligned(identity))
         var order: [Int] = []
         var used = [Bool](repeating: false, count: aspects.count)
+        // Rows of a few repeated shapes have only a handful of distinct orders, but
+        // seven photos of seven different shapes have 5,040; a fixed cap (every order
+        // of five photos) keeps that bounded — this runs for every candidate row — and
+        // deterministic.
+        var remaining = 120
         func permute() {
-            guard best.aligned > 0 else {
+            guard best.aligned > 0, remaining > 0 else {
                 return
             }
             if order.count == aspects.count {
+                remaining -= 1
                 let value = aligned(order)
                 if value < best.aligned {
                     best = (order, value)
@@ -460,19 +466,40 @@ private final class LightpaperTiledView: NSView {
         // slim portraits between rows of wide landscapes just to dodge a seam.
         let countWeight: CGFloat = 0.1
 
+        // Full arrangement searches allowed; past this (only reached with many
+        // distinct shapes) seams are scored in sample order, which is cheap.
+        var arrangements = 200
+
         func cost(sum: CGFloat) -> CGFloat {
             var value = abs(sum - target) / target
             value += countWeight * abs(CGFloat(current.count) - perRow) / perRow
-            // Only worth arranging when this subset could still win.
+            // Only worth checking seams when this subset could still win.
             if !previousSeams.isEmpty, value < bestCost {
-                value += 0.04 * CGFloat(bestArrangement(current.map { aspects[$0] }, avoiding: previousSeams).aligned)
+                let shapes = current.map { aspects[$0] }
+                let aligned: Int
+                if arrangements > 0 {
+                    arrangements -= 1
+                    aligned = bestArrangement(shapes, avoiding: previousSeams).aligned
+                } else {
+                    aligned = seamPositions(shapes).filter { seam in
+                        previousSeams.contains { abs($0 - seam) < 0.04 }
+                    }.count
+                }
+                value += 0.04 * CGFloat(aligned)
             }
             return value
         }
 
         let widest = aspects.max() ?? 0
+        // Exact-shape previews keep the search to at most a few thousand subsets, but a
+        // library of custom crops (every photo a different shape) can explode it to
+        // hundreds of thousands. A fixed budget bounds layout time on the main thread
+        // and stays deterministic; by then such a varied pool has long since offered
+        // a near-perfect fit.
+        var budget = 20_000
 
         func search(from start: Int, sum: CGFloat) {
+            budget -= 1
             if !current.isEmpty {
                 let value = cost(sum: sum)
                 if value < bestCost {
@@ -489,7 +516,7 @@ private final class LightpaperTiledView: NSView {
                 bestCost == .greatestFiniteMagnitude ? .greatestFiniteMagnitude : perRow + bestCost * perRow / countWeight
             )
             let slots = min(countLimit - CGFloat(current.count), CGFloat(aspects.count - start))
-            guard slots >= 1, sum < target,
+            guard budget > 0, slots >= 1, sum < target,
                   (target - (sum + slots * widest)) / target < bestCost else {
                 return
             }
