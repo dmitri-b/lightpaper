@@ -54,14 +54,13 @@ private let photosPerScreen = 140
 // uses only what it needs and ignores the surplus.
 private let sampleCandidateLimit = 240
 
-// How many tiles `deduplicateByLook` keeps before it stops analysing. This is a
-// buffer, not a target: the layout fills its rows from the first
-// `rowLookahead`-ish photos and places only ~10 per screen. Everything analysed
-// past that point is thrown away — and analysis is by
-// far the most expensive thing the saver does, at ~130ms of Vision work per
-// photo. Walking the whole `sampleCandidateLimit` buffer therefore spent ~30s
-// per screen to show a dozen photos. A generous multiple of the worst realistic
-// case keeps the layout from ever running short while cutting most of that cost.
+// How many tiles `deduplicateByLook` keeps before it stops analysing. The layout
+// places only ~10 per screen, but it picks them from this whole buffer — the more
+// photos it can choose from, the more exactly each row's photos fill the screen
+// width. Analysis is by far the most expensive thing the saver does, at ~130ms
+// of Vision work per photo, so walking the whole `sampleCandidateLimit` buffer
+// (~30s per screen) is not worth it; this bound gives the layout ample choice
+// while cutting most of that cost.
 private let keptTilesPerScreen = 60
 
 // How many recently shown months to remember and refuse to show again. Months are
@@ -110,10 +109,11 @@ private let minimumProminentBodyHeightFraction: CGFloat = 0.45
 private let preferredPhotosPerScreen: CGFloat = 10
 
 // How many upcoming photos `fitRow` considers when picking the set that fills a
-// row, and the most it will put in one row. Looking ahead lets each row be built
-// from photos whose combined aspect ratio matches the row almost exactly, so rows
-// fill the screen width at the target height with next to no cropping.
-private let rowLookahead = 24
+// row (the whole de-duplicated buffer), and the most it will put in one row.
+// Choosing from many photos lets each row be built from ones whose combined
+// aspect ratio matches the row almost exactly, so rows fill the screen width at
+// the target height with next to no cropping.
+private let rowLookahead = keptTilesPerScreen
 private let maxPhotosPerRow = 7
 
 private final class LightpaperTiledView: NSView {
