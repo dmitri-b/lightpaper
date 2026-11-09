@@ -363,7 +363,7 @@ private final class LightpaperTiledView: NSView {
                 perRow: perRow,
                 avoiding: seams
             )
-            let row = picked.map { pool[$0] }
+            let row = arrangeRow(picked.map { pool[$0] }, avoiding: seams)
             rows.append(row)
             seams = seamPositions(row.map(aspect))
             for index in picked.sorted(by: >) {
@@ -378,6 +378,43 @@ private final class LightpaperTiledView: NSView {
         let total = aspects.reduce(0, +)
         var running: CGFloat = 0
         return aspects.dropLast().map { running += $0; return running / total }
+    }
+
+    /// The left-to-right order of `row` with the fewest tile edges lining up with
+    /// the row above (`avoiding`), keeping the sample order on ties. Rows longer
+    /// than six photos are left as they are (their seams are already dense).
+    private func arrangeRow(_ row: [TileItem], avoiding previousSeams: [CGFloat]) -> [TileItem] {
+        guard !previousSeams.isEmpty, row.count > 1, row.count <= 6 else {
+            return row
+        }
+        func alignedSeams(_ order: [TileItem]) -> Int {
+            seamPositions(order.map(aspect)).filter { seam in
+                previousSeams.contains { abs($0 - seam) < 0.04 }
+            }.count
+        }
+        var best = row
+        var bestAligned = alignedSeams(row)
+        var order = row
+        func permute(_ k: Int) {
+            guard bestAligned > 0 else {
+                return
+            }
+            if k == order.count {
+                let aligned = alignedSeams(order)
+                if aligned < bestAligned {
+                    bestAligned = aligned
+                    best = order
+                }
+                return
+            }
+            for i in k..<order.count {
+                order.swapAt(k, i)
+                permute(k + 1)
+                order.swapAt(k, i)
+            }
+        }
+        permute(0)
+        return best
     }
 
     private func aspect(_ item: TileItem) -> CGFloat {
