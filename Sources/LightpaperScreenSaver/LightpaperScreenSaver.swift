@@ -312,26 +312,23 @@ private final class LightpaperTiledView: NSView {
             return
         }
 
+        // Estimate the row count from the sample's average shape (r rows hold
+        // ≈ r² · W / (H · meanAspect) photos), then compose the screen at that count
+        // and its neighbours and keep the one whose actual photo count is closest to
+        // the preference — the estimate alone runs high when rows fill with portraits.
         let lookahead = items.prefix(rowLookahead)
         let meanAspect = lookahead.reduce(0) { $0 + aspect($1) } / CGFloat(lookahead.count)
-        // With r rows the screen holds ≈ r · (W / (H / r)) / meanAspect photos.
-        func photoCountError(_ rows: Int) -> CGFloat {
-            let count = CGFloat(rows * rows) * availableWidth / (viewportHeight * meanAspect)
-            return abs(log(count / preferredPhotosPerScreen))
+        let estimate = Int((preferredPhotosPerScreen * viewportHeight * meanAspect / availableWidth).squareRoot().rounded())
+        let candidates = (max(1, estimate - 1)...max(1, estimate + 1)).map {
+            composeRows(count: $0, width: availableWidth, height: viewportHeight)
         }
-        let rowCount = (1...8).min { photoCountError($0) < photoCountError($1) } ?? 1
-        let targetAspect = availableWidth / (viewportHeight / CGFloat(rowCount))
-
-        var pool = items
-        var rows: [[TileItem]] = []
-        for _ in 0..<rowCount where !pool.isEmpty {
-            let picked = fitRow(pool.prefix(rowLookahead).map(aspect), target: targetAspect)
-            rows.append(picked.map { pool[$0] })
-            for index in picked.sorted(by: >) {
-                pool.remove(at: index)
-            }
-        }
-        items = rows.flatMap { $0 } + pool
+        let rows = candidates.min { a, b in
+            abs(log(CGFloat(a.flatMap { $0 }.count) / preferredPhotosPerScreen))
+                < abs(log(CGFloat(b.flatMap { $0 }.count) / preferredPhotosPerScreen))
+        } ?? []
+        let shown = rows.flatMap { $0 }
+        let shownURLs = Set(shown.map(\.url))
+        items = shown + items.filter { !shownURLs.contains($0.url) }
 
         // Each row's natural justified height, scaled together so the rows sum to the
         // viewport exactly. Rows are already near-equal, so the scale (and the crop
@@ -349,6 +346,22 @@ private final class LightpaperTiledView: NSView {
         }
 
         rebuildTileLayers()
+    }
+
+    /// `count` justified rows for a `width`×`height` screen, each filled (in sample
+    /// order) with the photos whose aspect ratios best sum to the row's.
+    private func composeRows(count: Int, width: CGFloat, height: CGFloat) -> [[TileItem]] {
+        let targetAspect = width / (height / CGFloat(count))
+        var pool = items
+        var rows: [[TileItem]] = []
+        for _ in 0..<count where !pool.isEmpty {
+            let picked = fitRow(pool.prefix(rowLookahead).map(aspect), target: targetAspect)
+            rows.append(picked.map { pool[$0] })
+            for index in picked.sorted(by: >) {
+                pool.remove(at: index)
+            }
+        }
+        return rows
     }
 
     private func aspect(_ item: TileItem) -> CGFloat {
