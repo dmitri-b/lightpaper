@@ -481,7 +481,13 @@ private final class LightpaperTiledView: NSView {
                   (target - (sum + slots * widest)) / target < bestCost else {
                 return
             }
-            for index in start..<aspects.count {
+            // A photo with the same aspect ratio as one already tried at this position
+            // leads to the same sums and seams as that earlier photo, which wins ties,
+            // so its whole subtree can be skipped. Previews come in a handful of exact
+            // shapes (3:2, 2:3, …), so this prunes most of the search.
+            var tried: [CGFloat] = []
+            for index in start..<aspects.count where !tried.contains(aspects[index]) {
+                tried.append(aspects[index])
                 current.append(index)
                 search(from: index + 1, sum: sum + aspects[index])
                 current.removeLast()
