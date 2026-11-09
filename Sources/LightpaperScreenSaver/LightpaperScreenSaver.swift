@@ -444,11 +444,15 @@ private final class LightpaperTiledView: NSView {
         func cost(sum: CGFloat) -> CGFloat {
             var value = abs(sum - target) / target
             value += countWeight * abs(CGFloat(current.count) - perRow) / perRow
-            // Seam checks allocate; skip them when this subset already can't win.
+            // Only worth checking seams when this subset could still win.
             if !previousSeams.isEmpty, value < bestCost {
-                let seams = seamPositions(current.map { aspects[$0] })
-                for seam in seams where previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
-                    value += 0.04
+                var running: CGFloat = 0
+                for index in current.dropLast() {
+                    running += aspects[index]
+                    let seam = running / sum
+                    if previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
+                        value += 0.04
+                    }
                 }
             }
             return value
