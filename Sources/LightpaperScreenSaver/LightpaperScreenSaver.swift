@@ -102,12 +102,12 @@ private let nearDuplicateFeaturePrintDistance: Float = 0.7
 private let minimumProminentFaceHeightFraction: CGFloat = 0.14
 private let minimumProminentBodyHeightFraction: CGFloat = 0.45
 
-// Preferred on-screen row height, in points. The mosaic always uses a whole number
-// of rows that exactly fills the screen (no gaps, no black bands), so the actual
-// row height is the viewport height divided by the row count closest to this.
-// Taller rows mean fewer, bigger photos, at the cost of enlarging Lightroom's
-// modest-resolution previews further.
-private let preferredRowHeight: CGFloat = 440
+// About how many photos one screen should show, whatever its size: few enough
+// that each is large, enough to read as a mosaic. The mosaic always uses a whole
+// number of rows that exactly fills the screen (no gaps, no black bands); the row
+// count is the one that, for photos of the sample's average shape, comes closest
+// to this. So a month of portraits gets taller rows than a month of landscapes.
+private let preferredPhotosPerScreen: CGFloat = 10
 
 // How many upcoming photos `fitRow` considers when picking the set that fills a
 // row, and the most it will put in one row. Looking ahead lets each row be built
@@ -312,7 +312,14 @@ private final class LightpaperTiledView: NSView {
             return
         }
 
-        let rowCount = max(1, Int((viewportHeight / preferredRowHeight).rounded()))
+        let lookahead = items.prefix(rowLookahead)
+        let meanAspect = lookahead.reduce(0) { $0 + aspect($1) } / CGFloat(lookahead.count)
+        // With r rows the screen holds ≈ r · (W / (H / r)) / meanAspect photos.
+        func photoCountError(_ rows: Int) -> CGFloat {
+            let count = CGFloat(rows * rows) * availableWidth / (viewportHeight * meanAspect)
+            return abs(log(count / preferredPhotosPerScreen))
+        }
+        let rowCount = (1...8).min { photoCountError($0) < photoCountError($1) } ?? 1
         let targetAspect = availableWidth / (viewportHeight / CGFloat(rowCount))
 
         var pool = items
