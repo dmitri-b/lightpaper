@@ -609,11 +609,20 @@ private final class IndexingAnimationView: NSView {
         layer?.addSublayer(captionLayer)
 
         // Version line, so a running saver can be told apart from a stale cached
-        // install. Reads from this bundle's Info.plist (short version + build).
+        // install. Reads from this bundle's Info.plist: short version + build, plus
+        // the build time (shown in local time) and commit stamped by build-saver.sh.
         let info = Bundle(for: IndexingAnimationView.self).infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        versionLayer.string = "Lightpaper \(short) (\(build))"
+        var parts = ["Lightpaper \(short) (\(build))"]
+        if let stamp = info?["LightpaperBuildDate"] as? String,
+           let date = ISO8601DateFormatter().date(from: stamp) {
+            parts.append("built " + date.formatted(date: .abbreviated, time: .shortened))
+        }
+        if let commit = info?["LightpaperCommit"] as? String {
+            parts.append(commit)
+        }
+        versionLayer.string = parts.joined(separator: " · ")
         versionLayer.alignmentMode = .center
         versionLayer.foregroundColor = NSColor(white: 0.5, alpha: 1).cgColor
         versionLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)

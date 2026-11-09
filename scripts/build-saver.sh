@@ -40,6 +40,21 @@ done
 lipo -create -output "$MACOS_DIR/$PRODUCT_NAME" $SLICES
 
 cp "$ROOT_DIR/Resources/Lightpaper.saver/Contents/Info.plist" "$CONTENTS_DIR/Info.plist"
+
+# Stamp when, and from which commit, this bundle was built so the indexing screen
+# can show it — the version number alone doesn't change between local builds.
+# "+dirty" marks a build with uncommitted changes.
+PLIST="$CONTENTS_DIR/Info.plist"
+BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+if COMMIT=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null); then
+    git -C "$ROOT_DIR" diff --quiet HEAD -- || COMMIT="$COMMIT+dirty"
+else
+    COMMIT=unknown
+fi
+/usr/libexec/PlistBuddy \
+    -c "Add :LightpaperBuildDate string $BUILD_DATE" \
+    -c "Add :LightpaperCommit string $COMMIT" \
+    "$PLIST"
 chmod +x "$MACOS_DIR/$PRODUCT_NAME"
 
 if command -v codesign >/dev/null 2>&1; then
