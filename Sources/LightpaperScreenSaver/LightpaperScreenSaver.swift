@@ -55,10 +55,9 @@ private let photosPerScreen = 140
 private let sampleCandidateLimit = 240
 
 // How many tiles `deduplicateByLook` keeps before it stops analysing. This is a
-// buffer, not a target: `composeRows` stops consuming items the moment its rows
-// overshoot the viewport, which on a real screen happens after ~6-20 tiles (rows
-// are capped at `maxRowUpscale`× the smallest native size, so they stay tall and
-// few). Everything analysed past that point is thrown away — and analysis is by
+// buffer, not a target: the layout fills its rows from the first
+// `rowLookahead`-ish photos and places only ~10 per screen. Everything analysed
+// past that point is thrown away — and analysis is by
 // far the most expensive thing the saver does, at ~130ms of Vision work per
 // photo. Walking the whole `sampleCandidateLimit` buffer therefore spent ~30s
 // per screen to show a dozen photos. A generous multiple of the worst realistic
@@ -103,20 +102,19 @@ private let nearDuplicateFeaturePrintDistance: Float = 0.7
 private let minimumProminentFaceHeightFraction: CGFloat = 0.14
 private let minimumProminentBodyHeightFraction: CGFloat = 0.45
 
-// How far a row may be enlarged past the native size of its smallest rendition.
-// Lightroom's standard previews are modest-resolution, so without some headroom
-// the justified rows always collapse to many tiny tiles (the row can never be
-// taller than its smallest native image). Allowing a bounded upscale trades a
-// little softness for far fewer, much larger tiles — the "show the photos big"
-// goal. 1.0 = the old never-upscale behaviour.
-private let maxRowUpscale: CGFloat = 2.4
+// Preferred on-screen row height, in points. The mosaic always uses a whole number
+// of rows that exactly fills the screen (no gaps, no black bands), so the actual
+// row height is the viewport height divided by the row count closest to this.
+// Taller rows mean fewer, bigger photos, at the cost of enlarging Lightroom's
+// modest-resolution previews further.
+private let preferredRowHeight: CGFloat = 440
 
-// A photo counts as "small" — and gets pushed to the bottom row(s) of the mosaic
-// rather than left in the middle — when its combined size score (native height ×
-// pixel area) falls below this fraction of the screen's median score. One low-res
-// tile in a middle row forces that whole justified row short; corralling the small
-// ones to the bottom keeps the upper rows big.
-private let smallSizeRatio: CGFloat = 0.85
+// How many upcoming photos `fitRow` considers when picking the set that fills a
+// row, and the most it will put in one row. Looking ahead lets each row be built
+// from photos whose combined aspect ratio matches the row almost exactly, so rows
+// fill the screen width at the target height with next to no cropping.
+private let rowLookahead = 24
+private let maxPhotosPerRow = 7
 
 private final class LightpaperTiledView: NSView {
     private var items: [TileItem]
@@ -301,189 +299,104 @@ private final class LightpaperTiledView: NSView {
         laidOutScale = 0
     }
 
+    /// Full-bleed justified mosaic: a whole number of equal-height rows that exactly
+    /// fills the viewport, no gutters. Each row is filled with the photos (from the
+    /// next few in the sample) whose combined aspect ratio best matches the row's,
+    /// so tiles keep their natural shape. The displayed photos are moved to the
+    /// front of `items` in display order, matching `tileFrames`.
     private func updateEditorialLayout(availableWidth: CGFloat, scale: CGFloat) {
         let viewportHeight = viewportHeight()
-
-        // 1. Compose the sample as-is to discover exactly which photos fill this
-        //    screen. Only this prefix is displayed; the rest of the (large) sample
-        //    is spare buffer.
-        let firstPass = composeRows(
-            from: items,
-            availableWidth: availableWidth,
-            viewportHeight: viewportHeight,
-            scale: scale
-        )
-        // 2. Sink any row holding a small (low-res) photo to the bottom, so a
-        //    low-res tile never sits in a middle row forcing it short — that short
-        //    row ends up at the bottom instead. Rows of big photos keep their order
-        //    and rhythm on top. Reordering whole composed rows (rather than the
-        //    photos) keeps every tile on screen and each row's packing intact.
-        let rows = sinkSmallRowsLast(firstPass.rows)
-        let totalHeight = firstPass.totalHeight
-
-        // 3. Scale the rows to fill the screen, but only ever downscale. When
-        //    there are enough photos the rows overshoot one screen and shrink to
-        //    fit; when a month (plus spillover) is too small to fill, the bottom
-        //    is left dark rather than upscaling anything.
-        let fill = totalHeight > 0 ? min(1, viewportHeight / totalHeight) : 1
-        var y: CGFloat = 0
-        for row in rows {
-            let height = row.height * fill
-            appendRow(row.entries, y: y, height: height, availableWidth: availableWidth)
-            y += height
+        frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
+        guard !items.isEmpty else {
+            rebuildTileLayers()
+            return
         }
 
-        frame = NSRect(x: 0, y: 0, width: availableWidth, height: viewportHeight)
+        let rowCount = max(1, Int((viewportHeight / preferredRowHeight).rounded()))
+        let targetAspect = availableWidth / (viewportHeight / CGFloat(rowCount))
+
+        var pool = items
+        var rows: [[TileItem]] = []
+        for _ in 0..<rowCount where !pool.isEmpty {
+            let picked = fitRow(pool.prefix(rowLookahead).map(aspect), target: targetAspect)
+            rows.append(picked.map { pool[$0] })
+            for index in picked.sorted(by: >) {
+                pool.remove(at: index)
+            }
+        }
+        items = rows.flatMap { $0 } + pool
+
+        // Each row's natural justified height, scaled together so the rows sum to the
+        // viewport exactly. Rows are already near-equal, so the scale (and the crop
+        // it implies) is tiny. Edges are snapped to device pixels so no hairline of
+        // background shows between tiles.
+        let natural = rows.map { row in availableWidth / row.reduce(0) { $0 + aspect($1) } }
+        let fill = viewportHeight / natural.reduce(0, +)
+        var top: CGFloat = 0
+        var cumulative: CGFloat = 0
+        for (index, row) in rows.enumerated() {
+            cumulative += natural[index] * fill
+            let bottom = index == rows.count - 1 ? viewportHeight : snap(cumulative, scale: scale)
+            appendRow(row, y: top, height: bottom - top, availableWidth: availableWidth, scale: scale)
+            top = bottom
+        }
+
         rebuildTileLayers()
     }
 
-    private typealias RowEntry = (item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)
-    private typealias ComposedRow = (entries: [RowEntry], height: CGFloat)
-
-    /// A photo's "size score" — native height × pixel area, i.e. `width × height²`,
-    /// so height counts twice. Used to spot the low-res tiles that force a row short.
-    private func sizeScore(_ entry: RowEntry) -> CGFloat {
-        entry.nativeHeight * entry.nativeWidth * entry.nativeHeight
+    private func aspect(_ item: TileItem) -> CGFloat {
+        CGFloat(item.pixelWidth) / CGFloat(max(item.pixelHeight, 1))
     }
 
-    /// Stable-partitions `rows` so every row containing a small (low-res) photo sinks
-    /// to the bottom, keeping the big-photo rows — and their target-height rhythm — up
-    /// top. "Small" is judged against the screen's *median* size score (robust to a
-    /// lone high-res photo amongst low-res previews, which a max-based cut would
-    /// misread as making all the rest "small"). Whole rows move, so no tile is dropped
-    /// and each row's packing is preserved. When every row (or no row) qualifies the
-    /// order is unchanged.
-    private func sinkSmallRowsLast(_ rows: [ComposedRow]) -> [ComposedRow] {
-        let scores = rows.flatMap { $0.entries.map(sizeScore) }.sorted()
-        guard !scores.isEmpty else {
-            return rows
-        }
-        let median = scores[scores.count / 2]
-        guard median > 0 else {
-            return rows
-        }
-        let cut = median * smallSizeRatio
-
-        var big: [ComposedRow] = []
-        var small: [ComposedRow] = []
-        for row in rows {
-            if row.entries.contains(where: { sizeScore($0) < cut }) {
-                small.append(row)
-            } else {
-                big.append(row)
-            }
-        }
-
-        return big + small
+    private func snap(_ value: CGFloat, scale: CGFloat) -> CGFloat {
+        (value * scale).rounded() / scale
     }
 
-    /// Packs `source` into justified rows top-down, packing enough images into each
-    /// row that its height never exceeds `maxRowUpscale`× the smallest native size
-    /// in the row — so the lowest-res image is enlarged by at most that factor.
-    /// Low-res photos still end up in denser rows; the headroom is what lets a row
-    /// of modest Lightroom previews stand tall instead of collapsing to tiny tiles.
-    /// Stops once the rows overshoot one screen; returns the rows and their
-    /// unscaled total height.
-    ///
-    /// Tuned for a "looser" mosaic: ~2-3 rows of 3-4 images = ~6-12 large tiles per
-    /// screen, so each rendition gets real estate. The high target clamps matter
-    /// most — without them no row ever exceeded ~760px tall on a 4K/5K display,
-    /// which was the real cap on tile size.
-    private func composeRows(
-        from source: [TileItem],
-        availableWidth: CGFloat,
-        viewportHeight: CGFloat,
-        scale: CGFloat
-    ) -> (rows: [ComposedRow], totalHeight: CGFloat) {
-        let targetHeights = [
-            min(max(viewportHeight * 0.66, 460), 1300),
-            min(max(viewportHeight * 0.50, 360), 1040),
-            min(max(viewportHeight * 0.60, 420), 1180),
-            min(max(viewportHeight * 0.46, 320), 940)
-        ]
-        var rows: [ComposedRow] = []
-        var cursor = 0
-        var rowIndex = 0
-        var totalHeight: CGFloat = 0
+    /// Indices into `aspects` of the photos (at most `maxPhotosPerRow`) whose aspect
+    /// ratios sum closest to `target`. Depth-first in sample order, replacing the best
+    /// only on strict improvement, so ties keep the earlier — more random — photos.
+    private func fitRow(_ aspects: [CGFloat], target: CGFloat) -> [Int] {
+        var best: [Int] = []
+        var bestError = CGFloat.greatestFiniteMagnitude
+        var current: [Int] = []
 
-        while cursor < source.count {
-            var entries: [RowEntry] = []
-            var rowAspect: CGFloat = 0
-            var minNativeHeight = CGFloat.greatestFiniteMagnitude
-            let target = targetHeights[rowIndex % targetHeights.count]
-            var settled = false
-
-            while cursor < source.count {
-                let item = source[cursor]
-                let size = nativeSize(for: item, scale: scale)
-                entries.append((item, size.width, size.height))
-                rowAspect += size.width / size.height
-                minNativeHeight = min(minNativeHeight, size.height)
-                cursor += 1
-
-                // Settle once the row is short enough both for the aesthetic
-                // target and to keep the lowest-res image within the upscale bound.
-                if availableWidth / rowAspect <= min(target, minNativeHeight * maxRowUpscale) {
-                    settled = true
-                    break
+        func search(from start: Int, sum: CGFloat) {
+            if !current.isEmpty {
+                let error = abs(sum - target) / target
+                if error < bestError {
+                    bestError = error
+                    best = current
                 }
             }
-
-            if !settled {
-                // Ran out of images mid-row; drop this partial row unless it is
-                // all we have, so the bottom never shows a stretched fragment.
-                if rows.isEmpty, !entries.isEmpty {
-                    let height = min(availableWidth / rowAspect, minNativeHeight * maxRowUpscale)
-                    rows.append((entries, height))
-                    totalHeight += height
-                }
-                break
+            guard current.count < maxPhotosPerRow, sum < target, bestError > 0.002 else {
+                return
             }
-
-            // Natural justified height, capped so the lowest-res image in the row
-            // is enlarged by at most `maxRowUpscale`× its native size.
-            let height = min(availableWidth / rowAspect, minNativeHeight * maxRowUpscale)
-            rows.append((entries, height))
-            totalHeight += height
-            rowIndex += 1
-
-            if totalHeight >= viewportHeight {
-                break
+            for index in start..<aspects.count {
+                current.append(index)
+                search(from: index + 1, sum: sum + aspects[index])
+                current.removeLast()
             }
         }
 
-        return (rows, totalHeight)
+        search(from: 0, sum: 0)
+        return best
     }
 
-    private func appendRow(
-        _ row: [(item: TileItem, nativeWidth: CGFloat, nativeHeight: CGFloat)],
-        y: CGFloat,
-        height: CGFloat,
-        availableWidth: CGFloat
-    ) {
-        let rowAspect = row.reduce(CGFloat(0)) { result, entry in
-            result + entry.nativeWidth / entry.nativeHeight
-        }
+    private func appendRow(_ row: [TileItem], y: CGFloat, height: CGFloat, availableWidth: CGFloat, scale: CGFloat) {
+        let rowAspect = row.reduce(CGFloat(0)) { $0 + aspect($1) }
         var x: CGFloat = 0
+        var cumulative: CGFloat = 0
 
-        for (index, entry) in row.enumerated() {
-            let width = index == row.count - 1
-                ? availableWidth - x
-                : availableWidth * ((entry.nativeWidth / entry.nativeHeight) / rowAspect)
-            tileFrames.append(NSRect(x: x, y: y, width: width, height: height))
-            x += width
+        for (index, item) in row.enumerated() {
+            cumulative += availableWidth * aspect(item) / rowAspect
+            let right = index == row.count - 1 ? availableWidth : snap(cumulative, scale: scale)
+            tileFrames.append(NSRect(x: x, y: y, width: right - x, height: height))
+            x = right
         }
     }
 
     private func viewportHeight() -> CGFloat {
         max(enclosingScrollView?.contentView.bounds.height ?? bounds.height, 1)
-    }
-
-    private func nativeSize(for item: TileItem, scale: CGFloat) -> NSSize {
-        NSSize(
-            width: max(CGFloat(item.pixelWidth) / scale, 1),
-            height: max(CGFloat(item.pixelHeight) / scale, 1)
-        )
     }
 
     private func cachedImage(for item: TileItem, maxPixelSize: Int) -> CachedCGImage? {
