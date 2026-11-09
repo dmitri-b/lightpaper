@@ -399,10 +399,14 @@ private final class LightpaperTiledView: NSView {
         var best: [Int] = []
         var bestCost = CGFloat.greatestFiniteMagnitude
         var current: [Int] = []
+        // Cost of each photo a row is off its share of `preferredPhotosPerScreen`,
+        // relative to that share. Strong enough that a row doesn't fill with a band of
+        // slim portraits between rows of wide landscapes just to dodge a seam.
+        let countWeight: CGFloat = 0.1
 
         func cost(sum: CGFloat) -> CGFloat {
             var value = abs(sum - target) / target
-            value += 0.03 * abs(CGFloat(current.count) - perRow) / perRow
+            value += countWeight * abs(CGFloat(current.count) - perRow) / perRow
             // Seam checks allocate; skip them when this subset already can't win.
             if !previousSeams.isEmpty, value < bestCost {
                 let seams = seamPositions(current.map { aspects[$0] })
@@ -429,7 +433,7 @@ private final class LightpaperTiledView: NSView {
             // this one can win.
             let countLimit = min(
                 CGFloat(maxPhotosPerRow),
-                bestCost == .greatestFiniteMagnitude ? .greatestFiniteMagnitude : perRow + bestCost * perRow / 0.03
+                bestCost == .greatestFiniteMagnitude ? .greatestFiniteMagnitude : perRow + bestCost * perRow / countWeight
             )
             let slots = min(countLimit - CGFloat(current.count), CGFloat(aspects.count - start))
             guard slots >= 1, sum < target,
