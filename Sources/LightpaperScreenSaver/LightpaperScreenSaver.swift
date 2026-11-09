@@ -113,7 +113,7 @@ private let preferredPhotosPerScreen: CGFloat = 10
 // row, and the most it will put in one row. Looking ahead lets each row be built
 // from photos whose combined aspect ratio matches the row almost exactly, so rows
 // fill the screen width at the target height with next to no cropping.
-private let rowLookahead = 24
+private let rowLookahead = 16
 private let maxPhotosPerRow = 7
 
 private final class LightpaperTiledView: NSView {
@@ -352,16 +352,32 @@ private final class LightpaperTiledView: NSView {
     /// order) with the photos whose aspect ratios best sum to the row's.
     private func composeRows(count: Int, width: CGFloat, height: CGFloat) -> [[TileItem]] {
         let targetAspect = width / (height / CGFloat(count))
+        let perRow = preferredPhotosPerScreen / CGFloat(count)
         var pool = items
         var rows: [[TileItem]] = []
+        var seams: [CGFloat] = []
         for _ in 0..<count where !pool.isEmpty {
-            let picked = fitRow(pool.prefix(rowLookahead).map(aspect), target: targetAspect)
-            rows.append(picked.map { pool[$0] })
+            let picked = fitRow(
+                pool.prefix(rowLookahead).map(aspect),
+                target: targetAspect,
+                perRow: perRow,
+                avoiding: seams
+            )
+            let row = picked.map { pool[$0] }
+            rows.append(row)
+            seams = seamPositions(row.map(aspect))
             for index in picked.sorted(by: >) {
                 pool.remove(at: index)
             }
         }
         return rows
+    }
+
+    /// Interior tile edges of a justified row, as fractions of its width.
+    private func seamPositions(_ aspects: [CGFloat]) -> [CGFloat] {
+        let total = aspects.reduce(0, +)
+        var running: CGFloat = 0
+        return aspects.dropLast().map { running += $0; return running / total }
     }
 
     private func aspect(_ item: TileItem) -> CGFloat {
@@ -372,23 +388,44 @@ private final class LightpaperTiledView: NSView {
         (value * scale).rounded() / scale
     }
 
-    /// Indices into `aspects` of the photos (at most `maxPhotosPerRow`) whose aspect
-    /// ratios sum closest to `target`. Depth-first in sample order, replacing the best
-    /// only on strict improvement, so ties keep the earlier — more random — photos.
-    private func fitRow(_ aspects: [CGFloat], target: CGFloat) -> [Int] {
+    /// Indices into `aspects` of the photos (at most `maxPhotosPerRow`) that best fill
+    /// a row of aspect `target`. Mostly that is the aspect sum closest to the target
+    /// (which is what keeps tiles uncropped); as lighter tie-breaks it prefers about
+    /// `perRow` photos and tile edges that don't line up with the row above
+    /// (`avoiding`), since stacked seams read as a rigid grid rather than a mosaic.
+    /// Depth-first in sample order, replacing the best only on strict improvement,
+    /// so ties keep the earlier — more random — photos.
+    private func fitRow(_ aspects: [CGFloat], target: CGFloat, perRow: CGFloat, avoiding previousSeams: [CGFloat]) -> [Int] {
         var best: [Int] = []
-        var bestError = CGFloat.greatestFiniteMagnitude
+        var bestCost = CGFloat.greatestFiniteMagnitude
         var current: [Int] = []
+
+        func cost(sum: CGFloat) -> CGFloat {
+            var value = abs(sum - target) / target
+            value += 0.03 * abs(CGFloat(current.count) - perRow) / perRow
+            // Seam checks allocate; skip them when this subset already can't win.
+            if !previousSeams.isEmpty, value < bestCost {
+                let seams = seamPositions(current.map { aspects[$0] })
+                for seam in seams where previousSeams.contains(where: { abs($0 - seam) < 0.04 }) {
+                    value += 0.01
+                }
+            }
+            return value
+        }
 
         func search(from start: Int, sum: CGFloat) {
             if !current.isEmpty {
-                let error = abs(sum - target) / target
-                if error < bestError {
-                    bestError = error
+                let value = cost(sum: sum)
+                if value < bestCost {
+                    bestCost = value
                     best = current
                 }
             }
-            guard current.count < maxPhotosPerRow, sum < target, bestError > 0.002 else {
+            // Adding a photo past `perRow` can only raise the count penalty, so stop
+            // once that alone exceeds the best cost found.
+            let nextCount = CGFloat(current.count + 1)
+            guard current.count < maxPhotosPerRow, sum < target,
+                  nextCount <= perRow || 0.03 * (nextCount - perRow) / perRow < bestCost else {
                 return
             }
             for index in start..<aspects.count {
