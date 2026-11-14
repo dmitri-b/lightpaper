@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # Fine-grained PAT with Contents: read/write on dmitri-b/homebrew-tap.
       # When unset, the cask-bump step is skipped and the release still ships.
