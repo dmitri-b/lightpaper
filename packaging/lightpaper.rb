@@ -1,18 +1,16 @@
 # Homebrew cask template for the Lightpaper screen saver.
 #
-# This is a reference copy. The published copy lives in the tap repo
-# `dmitri-b/homebrew-tap` at `Casks/lightpaper.rb`.
-# For each release, bump `version` and set `sha256` to the checksum of the
-# release's Lightpaper.saver.zip:
-#
-#   shasum -a 256 Lightpaper.saver.zip
+# The release workflow (.github/workflows/release.yml) publishes this file to
+# the tap repo `dmitri-b/homebrew-tap` at `Casks/lightpaper.rb`, filling in
+# @VERSION@ and @SHA256@ from the release tag and its Lightpaper.saver.zip.
+# Edit the cask here, not in the tap; everything above `cask` is dropped.
 #
 # Install with:
 #   brew install --cask dmitri-b/tap/lightpaper
 
 cask "lightpaper" do
-  version "0.1.8"
-  sha256 "a8e91646fff4412d4a0d014f3f6251923502d4c2c9d3709792347cab50764e71"
+  version "@VERSION@"
+  sha256 "@SHA256@"
 
   url "https://github.com/dmitri-b/lightpaper/releases/download/v#{version}/Lightpaper.saver.zip"
   name "Lightpaper"

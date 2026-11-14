@@ -46,10 +46,11 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           sha="$(shasum -a 256 Lightpaper.saver.zip | awk '{print $1}')"
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/dmitri-b/homebrew-tap.git" tap
-          cask="tap/Casks/lightpaper.rb"
-          sed -i.bak -E "s/^( *version )\"[^\"]*\"/\1\"${version}\"/" "$cask"
-          sed -i.bak -E "s/^( *sha256 )\"[^\"]*\"/\1\"${sha}\"/" "$cask"
-          rm -f "${cask}.bak"
+          # packaging/lightpaper.rb is the source of truth: drop its header
+          # comment and fill in this release's version and checksum.
+          sed -n '/^cask /,$p' packaging/lightpaper.rb \
+            | sed -e "s/@VERSION@/${version}/" -e "s/@SHA256@/${sha}/" \
+            > tap/Casks/lightpaper.rb
           git -C tap config user.name "github-actions[bot]"
           git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git -C tap diff --quiet; then
